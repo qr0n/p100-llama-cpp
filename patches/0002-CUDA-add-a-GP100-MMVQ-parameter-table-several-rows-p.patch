@@ -1,0 +1,153 @@
+From 3c1dcbf6b4f628dade42a108d49c1fb2690be039 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 22:23:50 +0000
+Subject: [PATCH 2/2] CUDA: add a GP100 MMVQ parameter table, several rows per
+ block
+
+mul_mat_vec_q processed one output row per CUDA block for ncols_dst == 1,
+so the activation loads and unpacking were repeated for every row. On
+GP100 __dp4a is emulated as four scalar int8 multiply-adds, which makes
+the kernel instruction-issue bound rather than bandwidth bound, so that
+repeated work is the dominant cost.
+
+Add MMVQ_PARAMETERS_PASCAL, selected only for __CUDA_ARCH__ == 600 (sm_61
+P40/P4 have __dp4a and keep the generic parameters), and let it hand back
+several rows per block for ncols_dst == 1 so the activation work is shared
+between them. Every other ncols_dst defers to the generic table.
+
+calc_rows_per_block now takes the quant type, mirroring calc_nwarps.
+K-quants use 4 rows (1/2/4/8 measured 40.8/48.3/52.2/51.3 tg on
+llama-3.1-8b Q4_K_M); everything else uses 2, which is worth ~4% tg on a
+mixed-type model. 4 is not used for the rest because q4_1 leaves
+test-backend-ops' 5e-4 NMSE bound for MUL_MAT there.
+
+Tesla P100, tg128, with the preceding q8_1-block-sum change:
+  llama-3.1-8b Q4_K_M, 1 card           39.28 -> 52.22  (+32.9%)
+  llama-3.1-8b Q4_K_M, 2 cards tensor   56.80 -> 70.00  (+23.2%)
+  Qwen3.8-27B UD-Q4_K_XL, 2 cards       19.36 -> 22.69  (+17.2%)
+pp512 is unchanged; dense prompt processing goes to cuBLAS on this card,
+so only decode is affected.
+
+test-backend-ops test -b CUDA0 -o MUL_MAT,MUL_MAT_ID: 1855 passed, 0 failed.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 56 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 52 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 9705348..ccc5a2d 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -64,6 +64,20 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+     }
+ }
+ 
++// Rows per block for GP100. Only the K-quants are raised: 4 was measured best for
++// them (1/2/4/8 -> 40.8/48.3/52.2/51.3 tg on llama-3.1-8b Q4_K_M), and 4 also keeps
++// q4_1 inside test-backend-ops' 5e-4 NMSE bound, which it exceeds at higher values.
++// Everything else uses 2, which is worth ~4% tg on a mixed-type model: Qwen3.8-27B
++// UD-Q4_K_XL spends ~7% of its decode in iq4_xs plus more in iq4_nl/iq3_s/q8_0, and
++// 19.36 -> 21.79 tg depends on those getting 2 rather than 1. 4 is not used for them
++// because q4_1 leaves test-backend-ops' 5e-4 NMSE bound for MUL_MAT there.
++#ifndef GGML_CUDA_MMVQ_ROWS_PASCAL_K
++#define GGML_CUDA_MMVQ_ROWS_PASCAL_K 4
++#endif
++#ifndef GGML_CUDA_MMVQ_ROWS_PASCAL
++#define GGML_CUDA_MMVQ_ROWS_PASCAL 2
++#endif
++
+ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_GENERIC = 0,
+     MMVQ_PARAMETERS_TURING,
+@@ -71,7 +85,8 @@ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_RDNA2,
+     MMVQ_PARAMETERS_RDNA3_0,
+     MMVQ_PARAMETERS_RDNA4,
+-    MMVQ_PARAMETERS_GB10
++    MMVQ_PARAMETERS_GB10,
++    MMVQ_PARAMETERS_PASCAL
+ };
+ 
+ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -87,6 +102,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_TURING;
+ #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+     return MMVQ_PARAMETERS_GB10;
++#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
++    // GP100 only. sm_61 (P40/P4) has __dp4a and keeps the generic parameters.
++    return MMVQ_PARAMETERS_PASCAL;
+ #else
+     return MMVQ_PARAMETERS_GENERIC;
+ #endif
+@@ -111,6 +129,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
+         return MMVQ_PARAMETERS_GB10;
+     }
++    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_PASCAL) {
++        return MMVQ_PARAMETERS_PASCAL;
++    }
+     return MMVQ_PARAMETERS_GENERIC;
+ }
+ 
+@@ -497,6 +518,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+                 return 1;
+         }
+     }
++    if (table_id == MMVQ_PARAMETERS_PASCAL) {
++        return calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC, small_k, halve_iters);
++    }
+     if (table_id == MMVQ_PARAMETERS_GB10) {
+         const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
+         // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
+@@ -521,7 +545,31 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     return 1;
+ }
+ 
+-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    if (table_id == MMVQ_PARAMETERS_PASCAL) {
++        // GP100 emulates __dp4a, so mul_mat_vec_q is instruction-issue bound rather than
++        // bandwidth bound. Handling several rows per block shares the activation loads
++        // and unpacking between them instead of repeating that work for every row.
++        // Only the batch-size-1 case is retuned here. Everything else defers to the
++        // generic table -- returning 2 for every ncols_dst > 1 silently diverged from
++        // it (generic gives 2 only for 2..8, and 1 above that), which hurt MoE routing.
++        if (ncols_dst != 1) {
++            return calc_rows_per_block(type, ncols_dst, MMVQ_PARAMETERS_GENERIC, small_k, nwarps);
++        }
++        if (small_k) {
++            return nwarps;
++        }
++        switch (type) {
++            case GGML_TYPE_Q2_K:
++            case GGML_TYPE_Q3_K:
++            case GGML_TYPE_Q4_K:
++            case GGML_TYPE_Q5_K:
++            case GGML_TYPE_Q6_K:
++                return GGML_CUDA_MMVQ_ROWS_PASCAL_K;
++            default:
++                return GGML_CUDA_MMVQ_ROWS_PASCAL;
++        }
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+@@ -560,7 +608,7 @@ static __global__ void mul_mat_vec_q(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -839,7 +887,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(warp_size, nwarps, 1);

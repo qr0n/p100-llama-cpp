@@ -1,0 +1,4 @@
+*.o
+p100_sweep
+burn
+main

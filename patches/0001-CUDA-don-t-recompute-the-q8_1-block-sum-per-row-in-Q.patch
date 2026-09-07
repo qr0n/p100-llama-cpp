@@ -1,0 +1,94 @@
+From 1697cee909ce4d3ef362bf3dd764204749eb4bff Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 21:41:06 +0000
+Subject: [PATCH 1/2] CUDA: don't recompute the q8_1 block sum per row in Q4_K
+ MMVQ
+
+vec_dot_q4_K_q8_1_impl_vmmq recomputed the sum of the q8_1 activation
+bytes for every output row via dp4a(0x01010101, u, ...), even though
+block_q8_1 already stores that sum in ds.y and the value does not depend
+on the weight row at all. vec_dot_q4_K_q8_1_impl_mmq already reads ds.y
+for exactly this purpose.
+
+Take the min term from ds.y instead. Each q8_1 block is covered by four
+threads, so only the first contributes it, otherwise the warp reduction
+would count it four times.
+
+Measured on a Tesla P100 (sm_60, GP100), where dp4a is emulated as four
+scalar int8 multiply-adds: the mul_mat_vec_q<Q4_K> inner loop drops from
+148 to 138 SASS instructions per 16 weights (-6.8%), XMAD 36 -> 30.
+The kernel is instruction-issue bound on this card, so the instruction
+count is what matters.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YF48HkWwxcUcooirDgCykq
+---
+ ggml/src/ggml-cuda/vecdotq.cuh | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 0f039c7..5ae878f 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -505,9 +505,14 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
+ #define VDR_Q4_K_Q8_1_MMQ  8
+ 
+ // contiguous v/x values
++// s8 holds the q8_1 block sums that block_q8_1 already stores in ds.y, so the min term
++// does not have to be recomputed per weight row. Each q8_1 block is covered by several
++// threads but the sum applies to the block as a whole, so exactly one of them passes
++// q8_block_lead == true; see vec_dot_q4_K_q8_1.
+ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+-    const uint8_t * __restrict__ m, const half2 & dm4, const float * __restrict__ d8) {
++    const uint8_t * __restrict__ m, const half2 & dm4, const float * __restrict__ d8,
++    const float * __restrict__ s8, const bool q8_block_lead) {
+ 
+     float sumf_d = 0.0f;
+     float sumf_m = 0.0f;
+@@ -518,10 +523,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+         const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
+ 
+         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
+-        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
+ 
+         sumf_d += d8[i] * (dot1 * sc[i]);
+-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
++        if (q8_block_lead) {
++            sumf_m += s8[i] * m[i];  // q4_K min times the pre-computed sum of the q8_1 block
++        }
+     }
+ 
+     const float2 dm4f = __half22float2(dm4);
+@@ -915,6 +921,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     int    v[2];
+     int    u[2*QR4_K];
+     float d8[QR4_K];
++    float s8[QR4_K];
+ 
+     // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
+     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+@@ -941,16 +948,22 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     const uint8_t * sc = (const uint8_t *)aux;
+     const uint8_t * m  = sc + 2;
+ 
++    // The min term needs sum(q8_1 block), which is already stored in ds.y. The four
++    // threads with the same bq8_offset each cover a quarter of the block, so only the
++    // first of them contributes it -- otherwise the warp reduction would count it 4x.
++    const bool q8_block_lead = ((iqs/2) % 4) == 0;
++
+     for (int i = 0; i < QR4_K; ++i) {
+         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+         d8[i] = __low2float(bq8i->ds);
++        s8[i] = __high2float(bq8i->ds);
+ 
+         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+         u[2*i+0] = q8[0];
+         u[2*i+1] = q8[4];
+     }
+ 
+-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
++    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8, s8, q8_block_lead);
+ }
+ 
+ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(

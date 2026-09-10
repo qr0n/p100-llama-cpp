@@ -28,6 +28,13 @@ Patch 0002 came from exactly this class of assumption, so the prior is good.
 magic-number conversion actually belongs: dequant is a genuine per-value
 conversion, which the dot product was not.
 
+> **Partly overtaken by `patches/0003` (see `prefill-and-multi-gpu.md`).** That
+> profile was single-GPU. Under `-sm tensor` the largest single prefill cost was
+> not in this list at all: 23.1% of GPU time was the cross-card AllReduce being
+> staged through host RAM in f32, because the internal AllReduce was gated to
+> Volta+. `convert_unary` at ~6.3% is still unexamined and is still the next
+> format-shuffling item.
+
 **5. fp16 MMVQ, revisited.** Rejected on instruction count (see
 `investigation.md` §7), but its budget only closes if the activation-side
 conversion is amortised across rows — which patch 0002 now does, 4x. The

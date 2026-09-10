@@ -1,0 +1,87 @@
+From 8f28aa5bee7ca013cdcf28892e56ebd5a1557a5e Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 05:58:33 +0000
+Subject: [PATCH] CUDA: enable the internal AllReduce on Pascal (sm_60/sm_61)
+
+ggml_cuda_ar_pipeline_init rejected every device below Volta because the
+chunked kernel's spin backoff calls __nanosleep, which is sm_70+. That is
+the only Volta-specific construct in the file: the transport is mapped
+pinned host memory, the arrival flags are plain volatile int paired with
+__threadfence_system (chosen deliberately for PCIe-attached GPUs without
+NVLink), and ggml_cuda_get_max_cpy_bytes already returns 8 instead of 16
+on pre-Volta, so the vector width adapts on its own.
+
+Replace __nanosleep on pre-Volta with a clock64() delay loop of equivalent
+duration and lower the init gate from VOLTA to PASCAL.
+
+Without this, SPLIT_MODE_TENSOR on a 2x P100 falls through to
+try_allreduce_butterfly (a stub returning false) and every layer boundary
+is serviced by the scheduler's generic inter-backend copy: measured on
+Qwen3.8-27B at a 2048-token prefill, 256 device-to-host and 258
+host-to-device transfers of 40 MB each, 20.5 GB of PCIe traffic and 23.1%
+of GPU time, in f32 and with a separate add kernel.
+
+Tested on GP100. sm_61 shares the code path but was not available to test.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WxWqBko2HYpd7w7fmc4Bo7
+---
+ ggml/src/ggml-cuda/allreduce.cu | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
+index d56129a..e315f79 100644
+--- a/ggml/src/ggml-cuda/allreduce.cu
++++ b/ggml/src/ggml-cuda/allreduce.cu
+@@ -70,6 +70,11 @@ static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
+ // false-sharing stalls on the polling GPU.
+ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
+ 
++// Pre-Volta spin backoff, in SM clock cycles, used in place of __nanosleep().
++// ~128 cycles is ~100 ns at the P100's 1328 MHz boost clock, matching the
++// __nanosleep(100) it stands in for.
++static constexpr long long GGML_CUDA_AR_SPIN_BACKOFF_CYCLES = 128;
++
+ // Number of blocks the chunked kernel launches with.  Each block stripes a
+ // disjoint slice of the data and synchronizes through its own arrival-token
+ // slot so multiple SMs can pump PCIe stores in parallel.
+@@ -164,7 +169,15 @@ static __global__ void ggml_cuda_ar_kernel(
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+             __nanosleep(100);
+ #else
+-            NO_DEVICE_CODE;
++            // Pascal has no __nanosleep.  The point of the backoff is to keep
++            // the polling thread from saturating the PCIe link with reads of
++            // the peer's mapped arrival slot, so a short clock-based delay
++            // serves the same purpose.  clock64() is per-SM and monotonic
++            // within a kernel launch, which is all this needs.
++            const long long t_wait_0 = clock64();
++            while (clock64() - t_wait_0 < GGML_CUDA_AR_SPIN_BACKOFF_CYCLES) {
++                // busy-wait
++            }
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+         }
+     }
+@@ -401,13 +414,16 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+         return nullptr;
+     }
+ 
+-    // The chunked kernel uses __nanosleep, which is sm70+ (Volta+).
++    // The chunked kernel's spin backoff uses __nanosleep on Volta+ and a
++    // clock64() delay loop on Pascal.  Both the mapped-host-memory transport
++    // and the volatile arrival flags work on Pascal, so sm_60/sm_61 qualify.
++    // Tested on GP100 (Tesla P100); sm_61 shares the same code path.
+     for (size_t i = 0; i < n_devices; ++i) {
+         const int cc = ggml_cuda_info().devices[devices[i]].cc;
+-        if (cc < GGML_CUDA_CC_VOLTA) {
++        if (cc < GGML_CUDA_CC_PASCAL) {
+             GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
+                            "(device %d has cc=%d); falling back\n",
+-                           __func__, GGML_CUDA_CC_VOLTA, devices[i], cc);
++                           __func__, GGML_CUDA_CC_PASCAL, devices[i], cc);
+             return nullptr;
+         }
+     }
+-- 
+2.53.0
+

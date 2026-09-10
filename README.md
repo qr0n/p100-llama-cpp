@@ -11,6 +11,15 @@ led to them.
 | Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor` | 19.40 tok/s | **22.70** | **+17.0%** |
 | any | prompt processing | — | — | unchanged |
 
+A third patch, added later, targets **multi-GPU** rather than the quantized
+kernels, and moves prompt processing as well:
+
+| model | config | before | after | |
+|---|---|---|---|---|
+| Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor`, pp8192 | 323.6 tok/s | **378.7** | **+17.0%** |
+| Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor`, tg128 | 22.3 tok/s | **24.5** | **+9.6%** |
+| Qwen3.8-27B Q4_K_XL | real 7,655-token request | 326.9 tok/s | **360.0** | **+10.1%** |
+
 Both patches are 61 added lines across two files. One is architecture-neutral;
 the other is guarded to GP100 and is byte-identical SASS on every other card.
 
@@ -85,6 +94,39 @@ K-quants use 4; legacy quants stay at 2, because at 4 exactly one case
 (`MUL_MAT type_a=q4_1, n=1`) drifts to NMSE 6.93e-4 against `test-backend-ops`'
 5e-4 bound. Everything passes at the shipped setting.
 
+**`patches/0003` — enable the internal AllReduce on Pascal.**
+`ggml_cuda_ar_pipeline_init` rejected every device below Volta, with the comment
+"the chunked kernel uses `__nanosleep`, which is sm70+". That is the only
+Volta-specific construct in `allreduce.cu`: the transport is mapped pinned host
+memory, the arrival flags are plain `volatile int` paired with
+`__threadfence_system()` — chosen, per the file's own comment, for
+"PCIe-attached GPUs without NVLink" — and `ggml_cuda_get_max_cpy_bytes()` already
+returns 8 instead of 16 on pre-Volta, so the vector width adapts on its own.
+
+Failing that gate meant `-sm tensor` fell through to `try_allreduce_butterfly`,
+a stub that returns `false`, and every layer boundary was serviced by the ggml
+scheduler's generic inter-backend copy: **f32, through host RAM, plus a separate
+add kernel.** On a 2048-token prefill of a *fully GPU-resident* 27B, an nvprof
+trace of the timed window shows **256 device-to-host and 258 host-to-device
+transfers of exactly 40.0 MB each — 20.5 GB of PCIe traffic, 23.1% of GPU time.**
+(40 MB = 2048 tokens x 5120 embed x 4 bytes; four round trips per layer.)
+
+The patch replaces `__nanosleep(100)` on pre-Volta with a `clock64()` delay loop
+of the same duration and lowers the gate to `GGML_CUDA_CC_PASCAL`. 20 added
+lines. **Tested on GP100; sm_61 shares the code path but was not available.**
+
+Note the two wins have different mechanisms. Prefill tensors are above the 1 MB
+`copy_threshold` and take the copy-engine route, so their gain is the bf16 wire
+format halving the bytes. Generation tensors are below it and take the fused
+chunked kernel, so their gain is fusion — and it survives with the bf16 wire
+disabled, i.e. bit-exact.
+
+**A warning that came out of the same investigation:** llama.cpp only enables
+peer access when `GGML_CUDA_P2P` is set. On this dual-socket P100 box, setting
+it is a **10.7x regression** (pp2048 357.34 -> 33.45), even though
+`cudaDeviceCanAccessPeer` returns true both ways. Peer access across the UPI hop
+is pathological here.
+
 ## Validation
 
 - `test-backend-ops test -b CUDA0 -o MUL_MAT,MUL_MAT_ID` — **1855 passed, 0 failed**
@@ -93,6 +135,14 @@ K-quants use 4; legacy quants stay at 2, because at 4 exactly one case
   off GP100, verified by compiling both trees and diffing `cuobjdump -sass`
 - benchmarks run from a matched start temperature; these cards thermally throttle
   after ~60 s, which will silently corrupt an A/B otherwise
+
+For `0003`, which changes a transport rather than a kernel: perplexity over an
+identical corpus is **3.5372 ± 0.06192 before, 3.5330 ± 0.06180 after**, and
+**3.5372 ± 0.06192 — exactly the baseline — with `GGML_CUDA_AR_BF16_THRESHOLD=0`**.
+That last row is the proof the transport change is numerically exact; the delta
+in the middle row is upstream's default bf16 wire format alone, about 7% of one
+standard error. The generated SASS of the new spin loop was checked to confirm
+the `clock64` backoff was not elided and that warp reconvergence uses `@!P2 SYNC`.
 
 ## Applying
 
@@ -135,9 +185,12 @@ Single-TU iteration made that cheap: lift the exact `nvcc` line out of
 
 - Measured on two Tesla P100-PCIE-16GB, CUDA 12.4, driver 580, Ubuntu, dual Xeon
   Gold 6148. Numbers elsewhere will differ; the *analysis* should hold for any GP100.
-- Decode only. Dense prompt processing on sm_60 goes to cuBLAS
-  (`ggml_cuda_should_use_mmq` gates MMQ to MoE), and cuBLAS `hgemm` already runs at
-  ~86% of this card's fp16 peak. Treat any `pp` change as a regression signal.
+- Patches `0001` and `0002` are decode only. Dense prompt processing on sm_60 goes
+  to cuBLAS (`ggml_cuda_should_use_mmq` gates MMQ to MoE), and cuBLAS `hgemm`
+  already runs at ~86% of this card's fp16 peak, so for those two treat any `pp`
+  change as a regression signal. Patch `0003` is the exception: it is a multi-GPU
+  transport fix and moves `pp` and `tg` together. It does nothing on one GPU, and
+  nothing under `-sm layer`, which does not allreduce.
 - **This helps GPU-resident models. It does not help an MoE run with `-ncmoe`.**
   Profiled on a 176B-A3B whose experts live in system RAM: 75% of GPU time is the
   one-time model upload, generation is dominated by the CPU computing 30 of 48

@@ -20,8 +20,17 @@ kernels, and moves prompt processing as well:
 | Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor`, tg128 | 22.3 tok/s | **24.5** | **+9.6%** |
 | Qwen3.8-27B Q4_K_XL | real 7,655-token request | 326.9 tok/s | **360.0** | **+10.1%** |
 
-Both patches are 61 added lines across two files. One is architecture-neutral;
-the other is guarded to GP100 and is byte-identical SASS on every other card.
+A fourth patch overlaps the two directions of that multi-GPU exchange:
+
+| model | config | before | after | |
+|---|---|---|---|---|
+| Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor`, pp2048 | 401.3 tok/s | **424.6** | **+5.7%** |
+| Qwen3.8-27B Q4_K_XL | real 7,655-token request | 361.1 tok/s | **379.7** | **+5.1%** |
+| Qwen3.8-27B Q4_K_XL | 35-min soak, 1.7k-17k-token prompts | 334.7 tok/s | **350.4** | **+4.7%** |
+
+`0001` and `0002` are 61 added lines across two files: one architecture-neutral,
+the other guarded to GP100 and byte-identical SASS on every other card. `0003` and
+`0004` are both in `allreduce.cu` and only affect `-sm tensor` across two GPUs.
 
 ## Why the P100 is a special case
 
@@ -109,7 +118,9 @@ scheduler's generic inter-backend copy: **f32, through host RAM, plus a separate
 add kernel.** On a 2048-token prefill of a *fully GPU-resident* 27B, an nvprof
 trace of the timed window shows **256 device-to-host and 258 host-to-device
 transfers of exactly 40.0 MB each — 20.5 GB of PCIe traffic, 23.1% of GPU time.**
-(40 MB = 2048 tokens x 5120 embed x 4 bytes; four round trips per layer.)
+(40 MB = 2048 tokens x 5120 embed x 4 bytes. The counts are both cards summed:
+128 per card = 64 layers x **2 exchanges per layer**, the tensor-parallel minimum —
+one after the attention/linear-attention output projection, one after the FFN.)
 
 The patch replaces `__nanosleep(100)` on pre-Volta with a `clock64()` delay loop
 of the same duration and lowers the gate to `GGML_CUDA_CC_PASCAL`. 20 added
@@ -120,6 +131,26 @@ Note the two wins have different mechanisms. Prefill tensors are above the 1 MB
 format halving the bytes. Generation tensors are below it and take the fused
 chunked kernel, so their gain is fusion — and it survives with the bf16 wire
 disabled, i.e. bit-exact.
+
+**`patches/0004` — run the copy-engine H2D on its own stream.**
+With `0003` in place, prefill-sized exchanges take the copy-engine path: each card
+copies its partial sum to pinned host memory (D2H), then pulls the peer's back
+(H2D). Both were issued on one stream, so **each card copied one direction at a
+time** although the P100 has two copy engines (`asyncEngineCount = 2`). A trace of
+a 2048-token prefill showed 642 ms per card of copies with zero overlap, 12.2% of
+wall time. A standalone test of 2 MB pinned copies — the chunk size the AllReduce
+uses — moves both directions in 55 ms on two streams against 100-111 ms serially,
+cross-socket included.
+
+The patch gives H2D its own stream and keeps every ordering the single stream gave
+implicitly with an explicit event. One of those orderings is easy to miss: the
+compute stream must wait for the card's *own* D2H to finish, not just the peer's
+data to arrive, because the add kernel writes the buffer the D2H is reading (and
+on the bf16 path that buffer is a pool allocation freed on return). **A build
+without that edge was exactly as fast and produced perplexity 7.68 instead of
+3.53.** llama-bench cannot see that; perplexity can. Architecture-neutral — any
+multi-GPU `-sm tensor` setup on the copy-engine path should benefit — but only
+measured here.
 
 **A warning that came out of the same investigation:** llama.cpp only enables
 peer access when `GGML_CUDA_P2P` is set. On this dual-socket P100 box, setting
@@ -143,6 +174,19 @@ That last row is the proof the transport change is numerically exact; the delta
 in the middle row is upstream's default bf16 wire format alone, about 7% of one
 standard error. The generated SASS of the new spin loop was checked to confirm
 the `clock64` backoff was not elided and that warp reconvergence uses `@!P2 SYNC`.
+
+`0003` was later **audited for the pre-Volta deadlock hazard** (no independent
+thread scheduling below sm_70): only lane 0 of each block spins, the flag it polls
+is written by the *peer GPU*, and both barriers are reached converged in SASS. Its
+small-tensor path was also checked for exactness by forcing every reduction
+through it — perplexity 3.5372 / 3.5330, identical to the copy-engine path. A
+35-minute soak with three concurrent clients ran clean.
+
+For `0004`: perplexity identical to `0003` alone in both wire modes (3.5330 /
+3.5372); 256-token temp-0 output byte-identical; a second 35-minute concurrent soak
+clean (68 requests, 0 hangs, output byte-identical to the pre-`0004` build). The
+series `0001..0004` applied with `git am` onto `b10660` reproduces the tested tree
+byte for byte.
 
 ## Applying
 
@@ -187,9 +231,10 @@ Single-TU iteration made that cheap: lift the exact `nvcc` line out of
   Gold 6148. Numbers elsewhere will differ; the *analysis* should hold for any GP100.
 - Patches `0001` and `0002` are decode only. Dense prompt processing on sm_60 goes
   to cuBLAS (`ggml_cuda_should_use_mmq` gates MMQ to MoE), and cuBLAS `hgemm`
-  already runs at ~86% of this card's fp16 peak, so for those two treat any `pp`
-  change as a regression signal. Patch `0003` is the exception: it is a multi-GPU
-  transport fix and moves `pp` and `tg` together. It does nothing on one GPU, and
+  already runs at ~80% of this card's true fp16 peak (19.0 TFLOP/s at 1325 MHz — the
+  15.80 TOP/s above is a microbenchmark that ran throttled), so for those two treat
+  any `pp` change as a regression signal. Patches `0003` and `0004` are the
+  exception: they are multi-GPU transport fixes (`0004` moves `pp` only). It does nothing on one GPU, and
   nothing under `-sm layer`, which does not allreduce.
 - **This helps GPU-resident models. It does not help an MoE run with `-ncmoe`.**
   Profiled on a 176B-A3B whose experts live in system RAM: 75% of GPU time is the
@@ -200,8 +245,8 @@ Single-TU iteration made that cheap: lift the exact `nvcc` line out of
   K-quants want 4, everything else 2, and 1 for both is what upstream does. A
   "Q4_K_XL" model is not all K-quants — Qwen3.8-27B spends ~7% of its decode in
   `iq4_xs` alone, which is why the non-K value matters and is worth ~4% tg there.
-- These have **not** been submitted upstream. They are arch-guarded and validated,
-  but upstreaming is a separate conversation with the maintainers.
+- These are **not submitted upstream, by decision**. They live here as patches
+  against a pinned llama.cpp release.
 
 ## Credit
 

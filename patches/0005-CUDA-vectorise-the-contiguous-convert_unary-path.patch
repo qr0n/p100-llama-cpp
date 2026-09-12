@@ -1,0 +1,96 @@
+From 190fae9b48e48adcfee5926db60564aecdd935fd Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 21:12:11 +0000
+Subject: [PATCH] CUDA: vectorise the contiguous convert_unary path
+
+convert_unary handles arbitrary strides one element per thread. The
+contiguous entry point convert_unary_cont_cuda always hits the degenerate
+case y[i] = cast(x[i]), a 4-byte load and 2-byte store per thread.
+
+Measured on Tesla P100 (GP100, sm_60), Qwen3.8-27B, 2048-token prefill: the
+dominant launch converts 2048*5120 f32 to f16 in 382.5 us, 62.9 MB at
+164 GB/s, against ~500 GB/s achievable for mixed traffic on this card.
+convert_unary is 6.1% of prefill here.
+
+Add a contiguous kernel processing 4 elements per thread (16-byte load,
+8-byte store for f32->f16), guarded on element count and pointer alignment
+with a fallback to the generic kernel.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NXCJnz8fv2F9PErEn89VEz
+---
+ ggml/src/ggml-cuda/convert.cu | 56 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 360c614..6258610 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -450,8 +450,64 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
+         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+ }
+ 
++// Vectorised contiguous conversion.
++//
++// The generic convert_unary above handles arbitrary strides and converts ONE
++// element per thread. convert_unary_cont_cuda always passes the fully
++// contiguous case (ne01 = ne02 = ne03 = 1), where that degenerates to
++// y[i] = cast(x[i]) with a 4-byte load and a 2-byte store per thread.
++//
++// Measured on a Tesla P100 (GP100, sm_60), Qwen3.8-27B, 2048-token prefill:
++// the dominant launch converts 2048*5120 = 10485760 f32 elements to f16 in
++// 382.5 us, i.e. 62.9 MB moved at 164 GB/s. The same card sustains ~500 GB/s
++// on mixed read+write traffic and 607 GB/s on pure reads (bench/sweep.cu), so
++// the scalar kernel runs at about a third of what the memory system allows.
++// convert_unary is 6.1% of prefill on this machine.
++//
++// Processing CONV_VEC elements per thread turns that into a 16-byte load and
++// an 8-byte store for f32->f16. Falls back to the generic kernel whenever the
++// pointers or the element count are not suitably aligned.
++#define CONV_VEC 4
++
++template <typename T> struct __align__(16) conv_vec_t { T v[CONV_VEC]; };
++
++template <typename src_t, typename dst_t>
++static __global__ void convert_unary_cont_vec(
++        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
++    const int64_t i = CONV_VEC*((int64_t)blockDim.x*blockIdx.x + threadIdx.x);
++
++    if (i >= k) {
++        return;
++    }
++
++    const src_t * x = (const src_t *) vx;
++
++    const conv_vec_t<src_t> sv = *((const conv_vec_t<src_t> *) (x + i));
++    conv_vec_t<dst_t> dv;
++#pragma unroll
++    for (int j = 0; j < CONV_VEC; ++j) {
++        dv.v[j] = ggml_cuda_cast<dst_t>(sv.v[j]);
++    }
++    *((conv_vec_t<dst_t> *) (y + i)) = dv;
++}
++
+ template <typename src_t, typename dst_t>
+ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
++    // The vector path reads and writes CONV_VEC elements at a time, so it needs
++    // the element count to be a multiple of CONV_VEC and both pointers aligned
++    // to the vector width. Anything else takes the generic kernel unchanged.
++    const bool can_vec =
++        (k % CONV_VEC == 0) &&
++        (((uintptr_t) vx) % (CONV_VEC*sizeof(src_t)) == 0) &&
++        (((uintptr_t) y)  % (CONV_VEC*sizeof(dst_t)) == 0);
++
++    if (can_vec) {
++        const int64_t nthreads = k / CONV_VEC;
++        const int64_t nblocks  = (nthreads + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
++        convert_unary_cont_vec<src_t, dst_t><<<nblocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
++        return;
++    }
++
+     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
+ }
+ 
+-- 
+2.53.0
+

@@ -11,6 +11,18 @@ Against llama.cpp **`b10660`** (commit `6c84c7d`).
 | `0002` GP100 MMVQ parameter table | `__CUDA_ARCH__ == 600` only | 4 rows per block for K-quants, the bulk of the win |
 | `0003` internal AllReduce on Pascal | `-sm tensor`, cc >= 600 | +10.1% pp / +9.6% tg on qwen3.8-27b; applies on top of `0002` |
 | `0004` AllReduce H2D on its own stream | `-sm tensor`, copy-engine path, all architectures | +5.1% real-request pp on qwen3.8-27b, tg unchanged; needs `0003` on Pascal |
+| `0005` vectorise contiguous `convert_unary` | all architectures; contiguous + aligned only | +4.6% real-request pp on qwen3.8-27b, tg unchanged; independent of `0001`-`0004` |
+
+`0005` targets the f32<->f16 conversions that feed the cuBLAS prefill path.
+`convert_unary` handles arbitrary strides one element per thread, and the
+contiguous entry point always hits the degenerate `y[i] = cast(x[i])` case — a
+4-byte load and a 2-byte store per thread. On GP100 that measured **164 GB/s**
+against ~500 GB/s achievable for mixed read+write traffic, while accounting for
+**6.1% of prefill**. Processing 4 elements per thread makes it a 16-byte load and
+an 8-byte store. Guarded on element count and pointer alignment, with a fallback
+to the generic kernel, so it is a no-op wherever those do not hold. Perplexity is
+bit-identical: 3.5330 / 3.5372 on the 60-chunk corpus, matching the baseline to
+four decimals in both wire formats.
 
 `0004` lets the two copy directions of each cross-card exchange overlap on the
 second copy engine. It adds a stream, so it needs a new ordering edge: the compute

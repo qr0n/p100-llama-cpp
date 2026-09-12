@@ -25,12 +25,32 @@ the abstract. It cannot be done here:
 
 Do not retry without an F16/BF16 source and more VRAM.
 
-**2. Concurrency.** On an issue-bound kernel, concurrent requests scale close to
-linearly. `--parallel 1` leaves most of that on the table. **Still untested**, and
-now the most promising untouched item. Note the cost is specific: the SSM
-recurrent-state buffer scales with `n_seq_max` times `spec-draft-n-max + 1`
-(~78 MiB per sequence), which is exactly why `--parallel 1` is what makes the
-MTP config fit at all. This trades VRAM for throughput.
+**2. ~~Concurrency.~~ TESTED — the claim is wrong.** This item said concurrent
+requests "scale close to linearly" on an issue-bound kernel. Measured on
+qwen3.8-27b, 2 cards, f16 KV, distinct prompts per client so prefix caching
+cannot inflate it:
+
+| `--parallel` | ctx/slot | aggregate tok/s | vs N=1 | per-client |
+|---:|---:|---:|---:|---|
+| 1 | 32768 | 18.36 | 1.00x | 24.61 |
+| 2 | 16384 | 25.25 | 1.38x | 17.47 |
+| 4 | 8192 | 29.51 | 1.61x | ~11.0 |
+| 8 | 4096 | 32.61 | **1.78x** | ~5.8 |
+
+**Eight clients buy 1.78x, not 8x**, and the marginal gain from 4 to 8 is 0.17x.
+Batching N sequences reads the weights once for N columns: purely bandwidth-bound
+would scale near-linearly, purely issue-bound would not scale at all. 1.78x says
+it is a mix — which corrects the extrapolation this item made from
+`investigation.md`'s batch-1 finding.
+
+VRAM is **not** the constraint (9901 -> 10313 MiB for 1 -> 8 slots, ~50 MiB/slot;
+the ~78 MiB/seq figure in `~/CLAUDE.md` is an MTP number already multiplied by
+`spec-draft-n-max + 1`). The real cost is that `--parallel N` divides `n_ctx` by
+N, and that per-client latency collapses.
+
+**Not worth deploying on a single-user interactive box** — latency is the
+objective there, and it goes 24.61 -> 5.8 tok/s. Worth up to +78% aggregate if
+the box ever serves several users at once.
 
 **3. ~~Two more Pascal gates that were tuned for the P40.~~ CLOSED — both
 negative.** Full write-up in `negative-results.md`.
@@ -49,15 +69,40 @@ negative.** Full write-up in `negative-results.md`.
 > the graphs gate lumps. The prior ("patch 0002 came from exactly this class of
 > assumption") was reasonable and still is; it just did not pay here.
 
-**4. Prefill format-shuffling.** cuBLAS `hgemm` is 73.9% of prefill and already at
-~86% of fp16 peak — nothing to win in the GEMM. `dequantize_block_q4_K/q6_K` is
-12.8% and `convert_unary` f32<->f16 round-trips are 6.3%. That ~19% is where an
-fp16 magic-number conversion actually belongs.
+**4. ~~Prefill format-shuffling.~~ PARTLY DONE — `convert_unary` vectorised,
+patch `0005`.** cuBLAS `hgemm` is 73.9% of prefill and already at ~86% of fp16
+peak — nothing to win in the GEMM. That part stands.
 
-> Partly overtaken by `patches/0003` (see `prefill-and-multi-gpu.md`): under
-> `-sm tensor` the largest single prefill cost was the cross-card AllReduce
-> staged through host RAM in f32, not anything in this list. `convert_unary` at
-> ~6.3% is still unexamined and is still the next format-shuffling item.
+Measured properly 2026-09-12 by differencing two profiles (d=49152 minus d=0,
+which isolates exactly one 49,152-token prefill):
+
+| kernel | share of prefill |
+|---|---:|
+| `maxwell_hgemm_128x128_tn` | 46.8% |
+| `flash_attn_tile` | 26.5% |
+| **`convert_unary`** | **6.1%** |
+| memcpy DtoH + HtoD | 9.3% |
+| `gated_delta_net_cuda` | 4.3% |
+| `dequantize_block_q5_K` | 1.1% |
+
+`convert_unary` at 6.1% confirms this item's original 6.3% estimate. The cause
+was not the *conversion* but the *access pattern*: the kernel handles arbitrary
+strides one element per thread, so the contiguous case ran a 4-byte load and a
+2-byte store per thread — **164 GB/s against ~500 GB/s achievable**. Vectorising
+to 4 elements per thread is worth **+4.6% on a real request**, perplexity
+bit-identical. See `patches/0005`.
+
+Two things this uncovered that are NOT done:
+
+- **The memcpy traffic is 9.3% of prefill**, larger than `convert_unary` was, and
+  was not in this item's list. It is 2560 copies of exactly 2.0 MB in *each*
+  direction per 2048-token prefill. That is the internal AllReduce's copy-engine
+  route (tensors above its 1 MB `copy_threshold`), so it is expected behaviour
+  after `0003`/`0004` rather than a bug — but nobody has asked whether the
+  threshold is right for this card, or whether the wire could be narrower.
+- **`dequantize_block_q4_K/q6_K` is only ~2% here**, not the 12.8% this item
+  quotes. That figure came from a single-GPU profile; under `-sm tensor` at depth
+  the mix is different. Re-measure before chasing it.
 
 **5. fp16 MMVQ, revisited. PROMOTED — now the best-supported idea here.**
 Rejected on instruction count (`investigation.md` §7); its budget only closes if

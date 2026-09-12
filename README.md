@@ -28,6 +28,15 @@ A fourth patch overlaps the two directions of that multi-GPU exchange:
 | Qwen3.8-27B Q4_K_XL | real 7,655-token request | 361.1 tok/s | **379.7** | **+5.1%** |
 | Qwen3.8-27B Q4_K_XL | 35-min soak, 1.7k-17k-token prompts | 334.7 tok/s | **350.4** | **+4.7%** |
 
+A fifth patch vectorises the f32<->f16 conversions that feed the cuBLAS prefill
+path:
+
+| model | config | before | after | |
+|---|---|---|---|---|
+| Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor`, pp2048 | 427.0 tok/s | **448.7** | **+5.1%** |
+| Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor`, pp16384 | 384.0 tok/s | **401.4** | **+4.5%** |
+| Qwen3.8-27B Q4_K_XL | real 7,655-token request | 381.1 tok/s | **398.5** | **+4.6%** |
+
 `0001` and `0002` are 61 added lines across two files: one architecture-neutral,
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and
 `0004` are both in `allreduce.cu` and only affect `-sm tensor` across two GPUs.

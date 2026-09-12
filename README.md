@@ -32,6 +32,27 @@ A fourth patch overlaps the two directions of that multi-GPU exchange:
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and
 `0004` are both in `allreduce.cu` and only affect `-sm tensor` across two GPUs.
 
+**The largest single win needs no patch at all — just a flag.** Use `f16` KV
+instead of `q8_0`:
+
+| model | config | before | after | |
+|---|---|---|---|---|
+| Qwen3.8-27B Q4_K_XL | real 74,919-token request, tg | 16.85 tok/s | **20.92** | **+24.1%** |
+| Qwen3.8-27B Q4_K_XL | same request, prompt | 271.59 tok/s | 272.40 | +0.3% |
+
+A quantized K sends attention's K·Q dot through `ggml_cuda_dp4a`, which sm_60
+emulates as four scalar int8 multiply-adds; an F16 K uses the packed fp16 unit,
+which GP100 has and the other Pascals do not. It reads 52% *more* memory and wins
+anyway. See [`docs/kv-cache-type.md`](docs/kv-cache-type.md) — including where it
+does **not** apply (speculative decoding) and the variant that would be better but
+crashes.
+
+Two plausible optimisations were also tried and **lost**: CUDA graphs (−1.4%) and
+MMVQ fusion (−2.1%), both of which reduce kernel launches. The reason generalises
+— on this card, launch-count reductions buy nothing and instruction-count
+reductions are everything. See
+[`docs/negative-results.md`](docs/negative-results.md).
+
 ## Why the P100 is a special case
 
 GP100 is the only Pascal with **full-rate fp16 and no `__dp4a`**. `__dp4a` — the

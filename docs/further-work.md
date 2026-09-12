@@ -104,21 +104,43 @@ Two things this uncovered that are NOT done:
   quotes. That figure came from a single-GPU profile; under `-sm tensor` at depth
   the mix is different. Re-measure before chasing it.
 
-**5. fp16 MMVQ, revisited. PROMOTED — now the best-supported idea here.**
-Rejected on instruction count (`investigation.md` §7); its budget only closes if
-the activation-side conversion is amortised across rows, which patch 0002 now
-does 4x. That precondition was already satisfied. What is new is direct evidence
-that the trade works on this card:
+**5. ~~fp16 MMVQ, revisited.~~ ANALYSED 2026-09-12 — NOT WORTH DOING.** Both of
+its proposed homes are weaker than this file previously claimed, and one of those
+claims was mine.
 
-**Switching the KV cache from `q8_0` to `f16` — which replaces an emulated
-`dp4a` dot with packed fp16 arithmetic — is worth +24.1% generation, while
-reading 52% MORE memory** (`kv-cache-type.md`). That is the same trade item 5
-proposes, in attention rather than the matmul. And `mul_mat_vec_q` is **67% of
-decode time** against attention's 1.4% at batch 1.
+**The dot product: parity, not a win.** `investigation.md` §7 rejected it on an
+instruction budget of ~76 against `dot1`'s 57 (1.33x). The stated missing
+precondition was amortising the activation-side conversion across rows, which
+patch `0002` now does 4x. Applying exactly that:
 
-Note this does **not** require f16 weights in VRAM (27.32 B params x 2 B =
-54.6 GB, impossible on 32 GB). It converts each quantized block to f16 in
-registers at the dot product. Zero extra VRAM.
+| term | as rejected | with `0002` |
+|---|---:|---:|
+| convert weights | 20 | 20 |
+| convert activations | 24 | **6** |
+| `HMUL2` multiply | 8 | 8 |
+| fp32 accumulate | 24 | 24 |
+| **total** | **76** (1.33x) | **58** (**1.02x**) |
+
+Satisfying the precondition moves it from *clearly worse* to *break-even*. It does
+not make it a win, because the dominant term — converting the **weights** — is
+untouched by row amortisation.
+
+**The f16 KV result does NOT transfer, and citing it here was an error.** An
+earlier revision of this item argued that `q8_0 -> f16` KV being worth +24.1%
+proved "the same trade" works. It is not the same trade. The KV cache is
+*stored* as f16, so that path has **no dequantisation at all** — it reads f16 and
+multiplies. fp16 MMVQ must convert Q4_K weights in registers on every use, which
+is precisely the ~20-instruction term the KV case never pays.
+
+**Dequantisation, §7's preferred home, is now ~2% not 12.8%.** §7 says
+`dequantize_block_q4_K<half>` is 12.8% of prefill and "that is where the trick
+pays". Measured 2026-09-12 under `-sm tensor` at d=49152, the whole
+`dequantize_block_*` family is **~2.1%** (`q5_K` 1.1%, `iq4_xs` 0.5%, `q4_K`
+0.5%). The 12.8% came from a single-GPU profile. Even a 2x win there is ~1% of
+prefill.
+
+Do not implement without new evidence — specifically, a way to make the
+**weight** conversion cheaper, since that is the term that decides it.
 
 **6. Long context.** Pascal has no MMA, so attention falls back — **but to
 `flash_attn_ext_vec` at batch-1 decode, not `flash_attn_tile`.** The tile kernel

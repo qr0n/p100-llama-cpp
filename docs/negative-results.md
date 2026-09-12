@@ -103,24 +103,35 @@ kernel launches is the wrong trade on this card.
 
 ---
 
-## Still open: where the ~31% idle goes
+## The "~31% idle" was a measurement error — CORRECTED
 
-GPU utilization during decode is ~64-69% on one card and two, with graphs and
-without. Four explanations are dead (above). The leading remaining hypothesis is
-**inter-token CPU time** — sampling, batch bookkeeping, the scheduler walking the
-graph — which graphs structurally cannot help, because nothing has been issued
-yet. At 52 tok/s a token is 19.2 ms; ~6 ms of CPU work between forward passes
-would produce this.
+Everything above about a ~31% GPU idle was wrong, and the error was in the
+analysis, not the hardware.
 
-Untested predictions that would confirm or kill it:
+`nvidia-smi utilization.gpu` was sampled across a whole `llama-bench` run and
+averaged over every sample where utilization was non-zero. That run contains two
+completely different phases, and the distribution is bimodal:
 
-1. Utilization should **rise with batch size**. Speculative decoding already
-   verifies ~5 tokens per pass and is faster per token.
-2. A CPU profile of the decode loop should show the gap outside any CUDA call.
+    203 samples @ 98.7%   <- steady-state decode
+    104 samples @ 10.3%   <- model load, which is memcpy-bound
+    -----------------------
+    mean of both = 68.8%  <- what was reported as "utilization while active"
 
-**Rule out the instrument first.** `nvidia-smi utilization.gpu` reports the
-fraction of a ~100 ms window in which any kernel ran, and its resolution for
-microsecond kernels is not documented well enough to trust to 5 pp.
-`nvprof --print-gpu-trace` is no help — it inflated the same measurement 22x
-(883 ms/token traced against ~41 ms real), and all of the inflation lands in the
-gaps it is supposed to be measuring.
+**Steady-state decode runs at 98.7%.** Measured independently through llama-swap
+on a real 700-token completion: **95.8%** for `qwen3.8-27b` and 92.8% for the MTP
+entry. The GPUs are saturated; there is no idle worth chasing.
+
+This makes the CUDA-graph result ordinary rather than mysterious. With ~1-4% idle
+there is no launch gap to recover, so graphs can only add their own per-graph
+bookkeeping — which is exactly the -1.4% measured. The premise that motivated
+trying them ("4572 launches per token and a third of the time idle") was half
+right: the launch count is real, the idle was not.
+
+The single-card control stands on its own and is the durable result: collapsing
+~1000 launches into ONE graph moved throughput 0.02%.
+
+**Lesson for the next person.** `nvidia-smi utilization.gpu` is usable for this
+question, but only on a steady-state window. Averaging across model load silently
+mixes a memcpy phase into the number. And `nvprof --print-gpu-trace` cannot
+substitute: it inflated the same workload 22x in wall time, and its reported
+GPU-busy time alone is 2.23x the entire unprofiled wall time.

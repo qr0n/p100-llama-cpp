@@ -85,3 +85,33 @@ crashes under `-sm tensor`:
 
 via `ggml_gallocr_alloc_graph`. Uniform types are fine; `-sm layer` is fine. An
 unhandled split-axis case, not a fundamental limit. Unfixed.
+
+## The mixed-type crash, diagnosed (2026-09-12)
+
+`-ctk f16 -ctv q8_0` would be strictly better than `f16`/`f16` — only **K** drives
+the emulated-`dp4a` dot, so V can stay quantized and save the memory. It aborts:
+
+    ggml-backend-meta.cpp: GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN)
+
+Instrumenting `handle_generic` to name the op before aborting gives:
+
+    UNKNOWN split for op=MUL name=attn_gated-3
+        src[0] name=attn_pregate-3     type=f32   axis=10   (MIRRORED)
+        src[1] name=gate_sigmoid-3     type=f32   axis=0    (SPLIT_AXIS_0)
+
+So it is **not** flash attention itself — `handle_flash_attn_ext` passes. It is
+qwen35's **gated-attention multiply**, which ends up with one MIRRORED operand
+and one split-on-dim-0 operand. `handle_generic` requires every source to share a
+split state, so the merge yields UNKNOWN and asserts.
+
+Reproduce: any `-sm tensor` run with K and V of different types. `-sm layer` is
+fine, and uniform types are fine either way.
+
+**Not fixed.** The repair belongs in split-state inference, and the payoff is only
+VRAM headroom (~700 MiB) — `f16`/`f16` already delivers the full +24.1% and fits
+production with 1588 MiB spare at worst. Recorded rather than patched, because a
+speculative change in that layer is how you get a fast wrong answer.
+
+Diagnostic branch: `gp100-mixedkv-diag` (`2fff7a5`) in the llama.cpp clone, local
+only. It only adds a `GGML_LOG_ERROR` before the existing assert; run with `-v`
+or llama-bench swallows it.

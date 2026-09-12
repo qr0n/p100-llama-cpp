@@ -36,17 +36,20 @@ construct. Lowering the gate to PASCAL does enable them.
 
 ### Why it does nothing — four hypotheses, all refuted
 
-The premise looked strong: batch-1 decode issues **4572 kernel launches per
-token** (994 `quantize_q8_1` at 2.3 us each, 418 `rms_norm_f32`, 352
-`k_bin_bcast`, 352 `unary_gated_op_kernel`), and `nvidia-smi` on an unprofiled
-run reports only ~69% GPU utilization.
+The premise: batch-1 decode issues **4572 kernel launches per token** (994
+`quantize_q8_1` at 2.3 us each, 418 `rms_norm_f32`, 352 `k_bin_bcast`, 352
+`unary_gated_op_kernel`). That part is real and still true.
+
+The other half of the premise — that the GPU was ~31% idle between them — turned
+out to be a **measurement error on our side**, see the correction at the end of
+this document. Steady-state decode is 98.7% utilized. Three hypotheses were
+chased before that was discovered, and they are kept here because each is ruled
+out on its own evidence:
 
 1. **Architecture** — no. Graphs run once the gate is lowered.
-2. **Launch overhead is the bottleneck** — no. Utilization is 69.5% with graphs
-   and 69.0% without.
-3. **Cross-card sync under tensor split** — no. A single-card control with no
-   AllReduce at all measures **64.0%**, i.e. it idles *more*, not less.
-4. **Graph thrash** (KV pointers changing each token would trip
+2. **Launch overhead is the bottleneck** — no. Graphs changed utilization by
+   0.5 pp and made throughput worse.
+3. **Graph thrash** (KV pointers changing each token would trip
    `ggml_cuda_graph_update_required`, resetting warmup forever) — no.
    `llama-bench -v` over 64 tokens: **0** warmup resets, **16254** graph reuses,
    0 disables.

@@ -5,7 +5,7 @@ Against llama.cpp **`b10660`** (commit `6c84c7d`).
     git checkout b10660
     git am *.patch
 
-The result is already in [`../llama.cpp/`](../llama.cpp) — all five applied,
+The result is already in [`../llama.cpp/`](../llama.cpp) — all six applied,
 checked 2026-09-18 by `../tools/verify-source.sh`.
 
 | patch | scope | effect |
@@ -15,6 +15,7 @@ checked 2026-09-18 by `../tools/verify-source.sh`.
 | `0003` internal AllReduce on Pascal | `-sm tensor`, cc >= 600 | +10.1% pp / +9.6% tg on qwen3.8-27b; applies on top of `0002` |
 | `0004` AllReduce H2D on its own stream | `-sm tensor`, copy-engine path, all architectures | +5.1% real-request pp on qwen3.8-27b, tg unchanged; needs `0003` on Pascal |
 | `0005` vectorise contiguous `convert_unary` | all architectures; contiguous + aligned only | +4.6% real-request pp on qwen3.8-27b, tg unchanged; independent of `0001`-`0004` |
+| `0006` internal AllReduce for N GPUs | `-sm tensor` on 3+ GPUs, all architectures | lets `0003`/`0004` apply beyond two cards; correctness-tested only, no 3-GPU speed data; needs `0003` on Pascal |
 
 `0005` targets the f32<->f16 conversions that feed the cuBLAS prefill path.
 `convert_unary` handles arbitrary strides one element per thread, and the

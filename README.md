@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0005`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0006`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -23,18 +23,22 @@ What you get depends on your setup:
 |---|---|---|
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
-| **exactly** two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
-| three or more P100s with `-sm tensor` | the single-card patches only — **not** `0003`/`0004` | see "Two cards only" below |
+| two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
+| three or more P100s with `-sm tensor` | all of the above + `0006` | **untested for speed** — see "Three or more cards" below |
 | P40 / GTX 10xx (sm_61) | `0001`, `0005` | small; `0002` is GP100-only by design. `./build.sh` detects the card; pass `CUDA_ARCH="60;61"` for a binary that serves both |
 
-**Two cards only, for the AllReduce patches.** llama.cpp's internal AllReduce
-(`ggml/src/ggml-cuda/allreduce.cu`) is written for exactly two devices — upstream,
-not this fork: `ggml_cuda_ar_pipeline_init` returns early unless `n_devices == 2`,
-and the copy path hard-codes `peer = 1 - i`. With three or more cards `-sm tensor`
-still runs, but logs `internal AllReduce init failed (n_devices != 2?)` and falls
-back to the generic f32-through-host-RAM exchange that `0003` exists to avoid, so
-`0003`/`0004` do nothing there. `-sm layer` never uses the AllReduce and works on
-any number of cards. N-card support is not implemented and has not been tested.
+**Three or more cards.** Upstream llama.cpp's internal AllReduce
+(`ggml/src/ggml-cuda/allreduce.cu`) only handles exactly two devices; with more it
+logs `internal AllReduce init failed (n_devices != 2?)` and falls back to the
+generic f32-through-host-RAM exchange that `0003` exists to avoid. `0006` extends
+it to N devices. It is **correctness-tested only**: on 2x P100 split into 3 and 4
+virtual devices with `GGML_CUDA_DEVICES`, perplexity matches the stock fallback
+(identical at 4, within 0.02% at 3) and is identical across the chunked,
+copy-engine and mixed paths; two-card output is bit-identical to `0005` and tg is
+unchanged. Virtual devices share a GPU and a PCIe link, so there is **no speed
+data for a real 3+ card box** — if you have one, compare `-sm tensor` with and
+without `GGML_CUDA_ALLREDUCE=none` and please report back. `-sm layer` never uses
+the AllReduce and works on any number of cards.
 
 **Do not set `GGML_CUDA_P2P`** — on a dual-socket P100 box it is a 10.7x
 regression (see below). Numbers everywhere in this README were measured on one
@@ -261,7 +265,7 @@ through it — perplexity 3.5372 / 3.5330, identical to the copy-engine path. A
 For `0004`: perplexity identical to `0003` alone in both wire modes (3.5330 /
 3.5372); 256-token temp-0 output byte-identical; a second 35-minute concurrent soak
 clean (68 requests, 0 hangs, output byte-identical to the pre-`0004` build). The
-full series `0001..0005` applied with `git am` onto `b10660` reproduces the tested
+full series `0001..0006` applied with `git am` onto `b10660` reproduces the tested
 tree byte for byte (re-checked 2026-09-18; that tree is `llama.cpp/` in this repo).
 
 ## Applying the patches yourself
@@ -285,7 +289,7 @@ hence the explicit gcc-13.
 
 | path | |
 |---|---|
-| `llama.cpp/` | upstream `b10660` + all five patches, ready to build |
+| `llama.cpp/` | upstream `b10660` + all six patches, ready to build |
 | `build.sh` | CUDA 12 / sm_60 build of `llama.cpp/`; `CUDA_ARCH`, `JOBS` overridable |
 | `tools/verify-source.sh` | re-derives `llama.cpp/` from upstream + `patches/` and diffs it |
 | `bench/sweep.cu` | self-verifying arithmetic and bandwidth sweep for GP100 — the source of the fp16-vs-int8 numbers above |

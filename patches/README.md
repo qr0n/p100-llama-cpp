@@ -5,6 +5,9 @@ Against llama.cpp **`b10660`** (commit `6c84c7d`).
     git checkout b10660
     git am *.patch
 
+The result is already in [`../llama.cpp/`](../llama.cpp) — all five applied,
+checked 2026-09-18 by `../tools/verify-source.sh`.
+
 | patch | scope | effect |
 |---|---|---|
 | `0001` reuse the stored q8_1 block sum | all architectures | 148 → 138 instructions per 16 weights, +4% tg on GP100 |

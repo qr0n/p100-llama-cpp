@@ -1,4 +1,8 @@
+# bench/ build outputs
 *.o
-p100_sweep
-burn
-main
+/bench/p100_sweep
+/bench/burn
+/bench/main
+
+# build of the bundled llama.cpp
+/llama.cpp/build/

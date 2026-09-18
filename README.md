@@ -1,5 +1,41 @@
 # Faster llama.cpp decode on the Tesla P100 (GP100, sm_60)
 
+## Quick start
+
+This repo ships a ready-to-build llama.cpp with every patch already applied:
+
+    git clone https://github.com/qr0n/p100-llama-cpp && cd p100-llama-cpp
+    ./build.sh                       # needs CUDA 12.x + cmake; binaries land in llama.cpp/build/bin/
+
+    # one P100
+    llama.cpp/build/bin/llama-server -m model.gguf -ngl 99
+
+    # two P100s: tensor split is where patches 0003/0004 apply
+    llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
+
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0005`, nothing else;
+`tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
+the exact source running on the machine these numbers came from.
+
+What you get depends on your setup:
+
+| your setup | what applies | expect |
+|---|---|---|
+| one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
+| any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
+| two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
+| P40 / GTX 10xx (sm_61) | `0001`, `0005` | small; `0002` is GP100-only by design. Build with `CUDA_ARCH="60;61"` |
+
+**Do not set `GGML_CUDA_P2P`** — on a dual-socket P100 box it is a 10.7x
+regression (see below). Numbers everywhere in this README were measured on one
+machine (2x P100-PCIE-16GB on different CPU sockets, 250 W cap); yours will
+differ, the mechanisms should not.
+
+llama.cpp is MIT-licensed, © the ggml authors — see `llama.cpp/LICENSE`. This
+fork is not affiliated with or endorsed by the llama.cpp project.
+
+---
+
 Two small patches to llama.cpp's CUDA backend that make token generation
 **33% faster on one P100 and 23% faster across two**, plus the measurements that
 led to them.
@@ -100,7 +136,7 @@ weight**, with the GPU busy 97% of decode wall time. So the lever is instruction
 *count*, and cuts convert to speedup nearly 1:1 with ~3.6x of bandwidth headroom
 still in reserve.
 
-## The two changes
+## The changes
 
 **`patches/0001` — stop recomputing the q8_1 block sum.**
 `vec_dot_q4_K_q8_1_impl_vmmq` recomputed the sum of the activation bytes for every
@@ -215,12 +251,13 @@ through it — perplexity 3.5372 / 3.5330, identical to the copy-engine path. A
 For `0004`: perplexity identical to `0003` alone in both wire modes (3.5330 /
 3.5372); 256-token temp-0 output byte-identical; a second 35-minute concurrent soak
 clean (68 requests, 0 hangs, output byte-identical to the pre-`0004` build). The
-series `0001..0004` applied with `git am` onto `b10660` reproduces the tested tree
-byte for byte.
+full series `0001..0005` applied with `git am` onto `b10660` reproduces the tested
+tree byte for byte (re-checked 2026-09-18; that tree is `llama.cpp/` in this repo).
 
-## Applying
+## Applying the patches yourself
 
-Against llama.cpp `b10660` (commit `6c84c7d`):
+The bundled `llama.cpp/` plus `./build.sh` is the easy path. To apply the patches
+to your own checkout instead, against llama.cpp `b10660` (commit `6c84c7d`):
 
     git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
     git checkout b10660
@@ -238,6 +275,9 @@ hence the explicit gcc-13.
 
 | path | |
 |---|---|
+| `llama.cpp/` | upstream `b10660` + all five patches, ready to build |
+| `build.sh` | CUDA 12 / sm_60 build of `llama.cpp/`; `CUDA_ARCH`, `JOBS` overridable |
+| `tools/verify-source.sh` | re-derives `llama.cpp/` from upstream + `patches/` and diffs it |
 | `bench/sweep.cu` | self-verifying arithmetic and bandwidth sweep for GP100 — the source of the fp16-vs-int8 numbers above |
 | `tools/ggufinfo.py` | dependency-free gguf parser; prints exact bytes-read-per-token for roofline work (not the file size — subtract `token_embd`) |
 | `data/q4k_one.sass` | extracted baseline SASS of the Q4_K MMVQ kernel |

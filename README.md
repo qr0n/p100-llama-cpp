@@ -23,8 +23,18 @@ What you get depends on your setup:
 |---|---|---|
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
-| two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
-| P40 / GTX 10xx (sm_61) | `0001`, `0005` | small; `0002` is GP100-only by design. Build with `CUDA_ARCH="60;61"` |
+| **exactly** two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
+| three or more P100s with `-sm tensor` | the single-card patches only — **not** `0003`/`0004` | see "Two cards only" below |
+| P40 / GTX 10xx (sm_61) | `0001`, `0005` | small; `0002` is GP100-only by design. `./build.sh` detects the card; pass `CUDA_ARCH="60;61"` for a binary that serves both |
+
+**Two cards only, for the AllReduce patches.** llama.cpp's internal AllReduce
+(`ggml/src/ggml-cuda/allreduce.cu`) is written for exactly two devices — upstream,
+not this fork: `ggml_cuda_ar_pipeline_init` returns early unless `n_devices == 2`,
+and the copy path hard-codes `peer = 1 - i`. With three or more cards `-sm tensor`
+still runs, but logs `internal AllReduce init failed (n_devices != 2?)` and falls
+back to the generic f32-through-host-RAM exchange that `0003` exists to avoid, so
+`0003`/`0004` do nothing there. `-sm layer` never uses the AllReduce and works on
+any number of cards. N-card support is not implemented and has not been tested.
 
 **Do not set `GGML_CUDA_P2P`** — on a dual-socket P100 box it is a 10.7x
 regression (see below). Numbers everywhere in this README were measured on one

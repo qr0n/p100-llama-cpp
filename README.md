@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0006`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0007`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -21,6 +21,7 @@ What you get depends on your setup:
 
 | your setup | what applies | expect |
 |---|---|---|
+| any P100 (sm_60), quantized model | `0007` | fp16 matrix-vector path: qwen3.8-27b tg 25.0 -> 33.2 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
 | two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |

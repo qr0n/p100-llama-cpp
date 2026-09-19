@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-gp100.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1798,7 +1799,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (cc <= GGML_CUDA_CC_PASCAL) {
+    if (cc == GGML_CUDA_CC_PASCAL && tensor->op == GGML_OP_MUL_MAT && ggml_cuda_gp100_mmvq_fusable_type(src0->type)) {
+        // GP100 has its own fp16 kernel that computes gate, up and the GLU in one pass (mmvq-gp100.cu)
+    } else if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
     //we only support fusion for ncols_dst = 1
@@ -3975,7 +3978,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!ggml_cuda_gp100_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
@@ -4248,6 +4253,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->graph_epoch++;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

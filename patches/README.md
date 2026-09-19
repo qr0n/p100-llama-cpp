@@ -5,8 +5,8 @@ Against llama.cpp **`b10660`** (commit `6c84c7d`).
     git checkout b10660
     git am *.patch
 
-The result is already in [`../llama.cpp/`](../llama.cpp) — all six applied,
-checked 2026-09-18 by `../tools/verify-source.sh`.
+The result is already in [`../llama.cpp/`](../llama.cpp) — all seven applied,
+checked 2026-09-19 by `../tools/verify-source.sh`.
 
 | patch | scope | effect |
 |---|---|---|
@@ -16,6 +16,7 @@ checked 2026-09-18 by `../tools/verify-source.sh`.
 | `0004` AllReduce H2D on its own stream | `-sm tensor`, copy-engine path, all architectures | +5.1% real-request pp on qwen3.8-27b, tg unchanged; needs `0003` on Pascal |
 | `0005` vectorise contiguous `convert_unary` | all architectures; contiguous + aligned only | +4.6% real-request pp on qwen3.8-27b, tg unchanged; independent of `0001`-`0004` |
 | `0006` internal AllReduce for N GPUs | `-sm tensor` on 3+ GPUs, all architectures | lets `0003`/`0004` apply beyond two cards; correctness-tested only, no 3-GPU speed data; needs `0003` on Pascal |
+| `0007` GP100 fp16 matrix-vector path | `__CUDA_ARCH__ == 600` device code only; batch 1..8 | qwen3.8-27b tg128 25.04 -> 33.22, MTP (draft 3) 26.15 -> 40.91 tok/s on real prompts, KLD vs Q8_0 better than stock; see [`../docs/fp16-mmvq.md`](../docs/fp16-mmvq.md). Replaces the `0001`/`0002` MMVQ path on GP100 for the types it covers |
 
 `0005` targets the f32<->f16 conversions that feed the cuBLAS prefill path.
 `convert_unary` handles arbitrary strides one element per thread, and the

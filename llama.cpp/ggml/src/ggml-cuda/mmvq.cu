@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-gp100.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1319,6 +1320,11 @@ void ggml_cuda_mul_mat_vec_q(
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
+
+    if (ggml_cuda_gp100_mmvq_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
+        ggml_cuda_gp100_mmvq(ctx, src0, src1, dst, fusion);
+        return;
+    }
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
 

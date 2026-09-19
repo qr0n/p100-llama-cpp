@@ -9163,6 +9163,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // batch-1 shapes that exercise the GP100 (sm_60) fp16 matrix-vector path (mmvq-gp100.cu):
+    // its small-row and large-row launch configurations, and the fused gate/up/SWIGLU mode
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q3_K}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{24, 5120}, {32, 256}, {64, 768}, {512, 1280}, {2048, 1024}, {3072, 2304}}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+        for (int64_t n : {32, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, n, 512, false, 1, 1, false, false, true, false, {1, 1}));
+        }
+        for (int64_t ncols = 2; ncols <= 8; ncols++) { // speculative-decoding verification batches
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, ncols, 1280, {1, 1}, {1, 1}));
+        }
+    }
+
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));

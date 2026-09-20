@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0007`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0008`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -21,7 +21,7 @@ What you get depends on your setup:
 
 | your setup | what applies | expect |
 |---|---|---|
-| any P100 (sm_60), quantized model | `0007` | fp16 matrix-vector path: qwen3.8-27b tg 25.0 -> 33.2 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
+| any P100 (sm_60), quantized model | `0007` + `0008` | fp16 matrix-vector path: **Llama-3.1-8B Q4_K_M tg 39.3 -> 79.6, i.e. 2.03x**; qwen3.8-27b tg 25.0 -> 33.7 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
 | two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
@@ -88,6 +88,28 @@ path:
 | Qwen3.8-27B Q4_K_XL | 2 cards, `-sm tensor`, pp16384 | 384.0 tok/s | **401.4** | **+4.5%** |
 | Qwen3.8-27B Q4_K_XL | real 7,655-token request | 381.1 tok/s | **398.5** | **+4.6%** |
 
+Patches `0007` and `0008` replace the batch-1 matrix-vector path entirely. sm_60
+has no `__dp4a`, so stock llama.cpp emulates every int8 dot with four scalar
+multiplies; GP100 does have a full-rate packed fp16 unit. `0007` converts the
+activations to fp16 once and unpacks the weights straight into **subnormal** half
+bit patterns, which is exact and needs no magic-number subtraction. `0008` splits
+short matrices' walk over K across the block's four warps, so a 24-row matmul
+stops being a 160-block serial chain. Measured on one card, same flags, cooled
+start, r=3:
+
+| model | config | stock `b10660` | `0001`-`0005` | `+0007`/`0008` | |
+|---|---|---|---|---|---|
+| Llama-3.1-8B Q4_K_M | 1 card, tg128 | 39.26 tok/s | 52.11 | **79.57** | **2.03x** |
+| Llama-3.1-8B Q4_K_M | 1 card, pp512 | 692.9 tok/s | 720.6 | 720.0 | unchanged |
+
+The 8B gains more than Qwen3.8-27B does (+34%) for a reason worth knowing before
+you predict your own model: Q4_K_M is dominated by **Q4_K, the fastest of these
+kernels** (517 GB/s in situ, 95% of what this access shape can reach), while
+Qwen3.8-27B is 45% Q5_K at 427 GB/s and 18% IQ4_XS at 346, and pays a cross-card
+AllReduce that a single-card model does not. **The closer your mix is to plain
+Q4_K, the bigger the win.** It is also *more* accurate than stock, not less — the
+path it replaces quantised the activations to 8 bits.
+
 `0001` and `0002` are 61 added lines across two files: one architecture-neutral,
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and
 `0004` are both in `allreduce.cu` and only affect `-sm tensor` across two GPUs.
@@ -108,9 +130,15 @@ does **not** apply (speculative decoding) and the variant that would be better b
 crashes.
 
 Two plausible optimisations were also tried and **lost**: CUDA graphs (−1.4%) and
-MMVQ fusion (−2.1%), both of which reduce kernel launches. The reason generalises
-— on this card, launch-count reductions buy nothing and instruction-count
-reductions are everything. See
+MMVQ fusion (−2.1%), both of which reduce kernel launches. This used to be stated
+here as "launch-count reductions buy nothing and instruction-count reductions are
+everything", and that blanket form is **wrong** — a later fusion that removed 128
+launches per token moved wall-clock time about 4x more than it moved kernel time,
+because the saving is the gap *between* kernels, which a profiler's kernel
+durations do not show. The accurate rule is narrower: a launch-count reduction
+pays only if it does not add work to a hot loop. Graphs add replay and update
+cost; MMVQ fusion adds predicates to an issue-bound loop. Both lost for that
+reason, not because launches are free. See
 [`docs/negative-results.md`](docs/negative-results.md).
 
 ## Why the P100 is a special case

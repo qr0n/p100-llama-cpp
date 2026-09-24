@@ -1,8 +1,8 @@
-From 2c843812b74ab81872c4c8bf8f6b916e0d2ea612 Mon Sep 17 00:00:00 2001
+From 05c4099cf98a58f0cb1d9f834e808d60b2be06a0 Mon Sep 17 00:00:00 2001
 From: qr0n <77075118+qr0n@users.noreply.github.com>
 Date: Sun, 20 Sep 2026 20:10:56 +0000
-Subject: [PATCH] CUDA: GP100 Q8_0/IQ4_NL MMVQ: split K over the block's four
- warps for short matrices
+Subject: [PATCH 1/2] CUDA: GP100 Q8_0/IQ4_NL MMVQ: split K over the block's
+ four warps for short matrices
 
 One warp per row over the whole K is a latency chain, not a bandwidth problem: a 24-row ssm_alpha
 at K=5120 walks 160 weight blocks serially, and b229222 measured the generic kernel winning that
@@ -23,10 +23,10 @@ Claude-Session: https://claude.ai/code/session_01Y9tBcqapUNvKQBjd2qBaCJ
  1 file changed, 65 insertions(+), 12 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmvq-gp100.cu b/ggml/src/ggml-cuda/mmvq-gp100.cu
-index 54376e1..36b2770 100644
+index f860f75cf..9c329d782 100644
 --- a/ggml/src/ggml-cuda/mmvq-gp100.cu
 +++ b/ggml/src/ggml-cuda/mmvq-gp100.cu
-@@ -94,6 +94,40 @@ static __device__ __forceinline__ void gp100_store(float * sum, float * __restri
+@@ -95,6 +95,40 @@ static __device__ __forceinline__ void gp100_store(float * sum, float * __restri
      }
  }
  
@@ -67,7 +67,7 @@ index 54376e1..36b2770 100644
  // One warp computes R rows. Within a warp, 4 groups of 8 threads each take one super-block per
  // iteration; thread t of a group owns sub-blocks 2*(t/2) and 2*(t/2)+1, positions 16*(t%2)..+15.
  // Q4_K and Q5_K share the super-block header (d, dmin, 12 bytes of 6-bit scales/mins) and the low-nibble
-@@ -574,7 +608,9 @@ template <ggml_type type> struct gp100_b32;
+@@ -941,7 +975,9 @@ template <ggml_type type> struct gp100_b32;
  template <> struct gp100_b32<GGML_TYPE_Q8_0>   { typedef block_q8_0   block; };
  template <> struct gp100_b32<GGML_TYPE_IQ4_NL> { typedef block_iq4_nl block; };
  
@@ -78,7 +78,7 @@ index 54376e1..36b2770 100644
  static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
          const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
          float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
-@@ -590,7 +626,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
+@@ -957,7 +993,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
  
      const int lane = threadIdx.x % WARP_SIZE;
      const int warp = threadIdx.x / WARP_SIZE;
@@ -87,7 +87,7 @@ index 54376e1..36b2770 100644
      const int nb   = nsb * (QK_K / QK8_0); // blocks per row
  
      const uint4 * rowp[RT];
-@@ -605,7 +641,8 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
+@@ -972,7 +1008,8 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
          sum[r] = 0.0f;
      }
  
@@ -97,7 +97,7 @@ index 54376e1..36b2770 100644
          const int nblk = min(nb - b0, 32);
          const int nu4  = (nblk * BS + 15) / 16;
          uint4 v0[RT], v1[RT], v2[RT];
-@@ -681,7 +718,11 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
+@@ -1048,7 +1085,11 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
          }
      }
  
@@ -110,8 +110,8 @@ index 54376e1..36b2770 100644
  #else
      GGML_UNUSED_VARS(vW, vG, y, ys, s16, dst, nrows, nsb, stride_row);
      NO_DEVICE_CODE;
-@@ -720,18 +761,19 @@ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, cons
-     return dst->ne[1] == 1 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+@@ -1095,18 +1136,19 @@ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, cons
+     return src1->ne[2] == 1 && src1->ne[3] == 1 && dst->nb[0] == sizeof(float) &&
             src0->ne[2] == 1 && src0->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
             src0->ne[0] % QK_K == 0 && src0->nb[1] % 2 == 0 && (uintptr_t) src0->data % 16 == 0 &&
 -           (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->nb[1] % 16 == 0) && // Q6_K/Q3_K are staged
@@ -136,7 +136,7 @@ index 54376e1..36b2770 100644
      kernel<<<nblocks, 128, 0, stream>>>(W, G, y, ys, s16, dst, nrows, nsb, stride_row);
  }
  
-@@ -768,13 +810,23 @@ template <bool GLU, int R>
+@@ -1143,13 +1185,23 @@ template <bool GLU, int R>
  static void gp100_dispatch_r(const ggml_type type, const void * W, const void * G, const half * y, const float2 * ys,
                               const float * s16, float * dst, const int nrows, const int nsb, const int stride_row, cudaStream_t stream) {
  #define GP100_LAUNCH(K) gp100_launch<K, R>(W, G, y, ys, s16, dst, nrows, nsb, stride_row, stream)
@@ -161,7 +161,7 @@ index 54376e1..36b2770 100644
                  break;
              }
              GGML_ABORT("Q8_0 supports at most 4 rows per warp");
-@@ -786,7 +838,7 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void *
+@@ -1161,7 +1213,7 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void *
              GGML_ABORT("Q3_K supports at most 4 rows per warp");
          case GGML_TYPE_IQ4_NL:
              if constexpr (R <= 4) {
@@ -170,7 +170,7 @@ index 54376e1..36b2770 100644
                  break;
              }
              GGML_ABORT("IQ4_NL supports at most 4 rows per warp");
-@@ -799,6 +851,7 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void *
+@@ -1174,6 +1226,7 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void *
          default: GGML_ABORT("unsupported type for the GP100 MMVQ path");
      }
  #undef GP100_LAUNCH

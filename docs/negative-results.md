@@ -138,3 +138,21 @@ question, but only on a steady-state window. Averaging across model load silentl
 mixes a memcpy phase into the number. And `nvprof --print-gpu-trace` cannot
 substitute: it inflated the same workload 22x in wall time, and its reported
 GPU-busy time alone is 2.23x the entire unprofiled wall time.
+
+## Deferring a read past its tensor's last graph consumer (2026-09-24): +1.7% and wrong
+
+A first version of `0009`'s alpha/beta fusion skipped `ADD(alpha, dt)`, `SOFTPLUS*A`
+and `SIGMOID(beta)` and had gated_delta_net read the raw projections itself. It was
+**+1.7% on tg128 and produced KLD 0.0855 against the 0.0113 bar (top-1 88.0%)**:
+ggml-alloc frees a buffer after its last *graph* consumer, and the beta projection,
+executed in between, was placed on alpha's buffer. Benchmarks cannot see this. `0009`
+now proves at match time that nothing that runs in between overlaps a deferred
+source (`ggml_cuda_gp100_not_clobbered`) and splits that fusion into two whose reads
+are safe. See [`delta-net-fusions.md`](delta-net-fusions.md).
+
+## 8 rows per warp for the Q6_K output head (2026-09-20): null
+
+The output head is the one Q6_K shape with short rows under `-sm tensor` (K = 2560,
+124160 rows), and it ran at ~237 GB/s vs ~466 for the rest of Q6_K. R=8 instead of 4
+measured **-0.2% tg128** (33.61/33.63 vs 33.69/33.69, alternating, cooled) — noise.
+It is carried in `0009` only because it is part of the tree that was tested.

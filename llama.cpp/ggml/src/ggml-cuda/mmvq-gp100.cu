@@ -95,6 +95,40 @@ static __device__ __forceinline__ void gp100_store(float * sum, float * __restri
     }
 }
 
+// Same, but the block's four warps each summed a different slice of K, so their sums are combined through
+// shared memory before the store. For short matrices one warp per row over the whole K is a latency chain:
+// a 24-row ssm_alpha at K=5120 walks 160 weight blocks serially, and the generic kernel beat us there.
+template <int R, bool GLU>
+static __device__ __forceinline__ void gp100_store_ksplit(float * sum, float * __restrict__ dst, const int row0,
+                                                          const int nrows, const int lane, const int warp) {
+    constexpr int RT = GLU ? 2*R : R;
+    __shared__ float red[4][RT];
+#pragma unroll
+    for (int r = 0; r < RT; r++) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            sum[r] += __shfl_xor_sync(0xFFFFFFFF, sum[r], o);
+        }
+        if (lane == 0) {
+            red[warp][r] = sum[r];
+        }
+    }
+    __syncthreads();
+    if (warp != 0) {
+        return;
+    }
+#pragma unroll
+    for (int r = 0; r < RT; r++) {
+        sum[r] = red[0][r] + red[1][r] + red[2][r] + red[3][r];
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        if (lane == 0 && row0 + r < nrows) {
+            dst[row0 + r] = GLU ? ggml_cuda_op_silu_single(sum[R + r]) * sum[r] : sum[r];
+        }
+    }
+}
+
 // One warp computes R rows. Within a warp, 4 groups of 8 threads each take one super-block per
 // iteration; thread t of a group owns sub-blocks 2*(t/2) and 2*(t/2)+1, positions 16*(t%2)..+15.
 // Q4_K and Q5_K share the super-block header (d, dmin, 12 bytes of 6-bit scales/mins) and the low-nibble
@@ -941,7 +975,9 @@ template <ggml_type type> struct gp100_b32;
 template <> struct gp100_b32<GGML_TYPE_Q8_0>   { typedef block_q8_0   block; };
 template <> struct gp100_b32<GGML_TYPE_IQ4_NL> { typedef block_iq4_nl block; };
 
-template <ggml_type type, int R, bool GLU>
+// KS: how many of the block's four warps cooperate on one row group, each taking every KS-th chunk of K.
+// KS = 1 is one warp per R rows over the whole K; KS = 4 shortens that chain fourfold for short matrices.
+template <ggml_type type, int R, bool GLU, int KS>
 static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
         const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
         float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
@@ -957,7 +993,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
-    const int row0 = (blockIdx.x * 4 + warp) * R;
+    const int row0 = (blockIdx.x * (4 / KS) + warp / KS) * R;
     const int nb   = nsb * (QK_K / QK8_0); // blocks per row
 
     const uint4 * rowp[RT];
@@ -972,7 +1008,8 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
         sum[r] = 0.0f;
     }
 
-    for (int b0 = 0; b0 < nb; b0 += 32) {
+    for (int c0 = warp % KS; c0 * 32 < nb; c0 += KS) {
+        const int b0   = c0 * 32;
         const int nblk = min(nb - b0, 32);
         const int nu4  = (nblk * BS + 15) / 16;
         uint4 v0[RT], v1[RT], v2[RT];
@@ -1048,7 +1085,11 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
         }
     }
 
-    gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    if constexpr (KS == 1) {
+        gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    } else {
+        gp100_store_ksplit<R, GLU>(sum, dst, row0, nrows, lane, warp);
+    }
 #else
     GGML_UNUSED_VARS(vW, vG, y, ys, s16, dst, nrows, nsb, stride_row);
     NO_DEVICE_CODE;
@@ -1095,18 +1136,19 @@ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, cons
     return src1->ne[2] == 1 && src1->ne[3] == 1 && dst->nb[0] == sizeof(float) &&
            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
            src0->ne[0] % QK_K == 0 && src0->nb[1] % 2 == 0 && (uintptr_t) src0->data % 16 == 0 &&
-           (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->nb[1] % 16 == 0) && // Q6_K/Q3_K are staged
-           // Q8_0 runs one warp per row over the whole K: for tiny matrices (ssm_alpha/beta, 24 rows/card) that is
-           // latency bound, 10.1 vs 5.7 us for the generic kernel in situ
-           !(src0->type == GGML_TYPE_Q8_0 && src0->ne[1] < 128);
+           (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->nb[1] % 16 == 0); // Q6_K/Q3_K are staged
+           // Tiny Q8_0 matrices (ssm_alpha/beta, 24 rows/card) used to go back to the generic kernel, which won
+           // 5.7 vs 10.1 us in situ because one warp per row walks all 160 weight blocks of K serially. The
+           // K-split kernel splits that walk over the block's four warps, so they are admitted again.
 }
 
 typedef void (*gp100_mmvq_kernel_t)(const void *, const void *, const half *, const float2 *, const float *, float *, int, int, int);
 
-template <gp100_mmvq_kernel_t kernel, int R>
+template <gp100_mmvq_kernel_t kernel, int R, int KS = 1>
 static void gp100_launch(const void * W, const void * G, const half * y, const float2 * ys, const float * s16, float * dst,
                          const int nrows, const int nsb, const int stride_row, cudaStream_t stream) {
-    const int nblocks = (nrows + 4*R - 1) / (4*R); // 4 warps per block, R rows per warp
+    constexpr int RPB    = (4 / KS) * R;           // rows per block: 4 warps, KS of them sharing a row group
+    const int     nblocks = (nrows + RPB - 1) / RPB;
     kernel<<<nblocks, 128, 0, stream>>>(W, G, y, ys, s16, dst, nrows, nsb, stride_row);
 }
 
@@ -1143,13 +1185,23 @@ template <bool GLU, int R>
 static void gp100_dispatch_r(const ggml_type type, const void * W, const void * G, const half * y, const float2 * ys,
                              const float * s16, float * dst, const int nrows, const int nsb, const int stride_row, cudaStream_t stream) {
 #define GP100_LAUNCH(K) gp100_launch<K, R>(W, G, y, ys, s16, dst, nrows, nsb, stride_row, stream)
+// Short matrices take the K-split kernel: four warps share a row group instead of taking a row each, which
+// quarters the serial walk over K. 2048 is the same row count at which R already drops to 1.
+#define GP100_LAUNCH_B32(T)                                                                                   \
+    do {                                                                                                      \
+        if (nrows < 2048) {                                                                                   \
+            gp100_launch<(gp100_mmvq_b32<T, R, GLU, 4>), R, 4>(W, G, y, ys, s16, dst, nrows, nsb, stride_row, stream); \
+        } else {                                                                                              \
+            gp100_launch<(gp100_mmvq_b32<T, R, GLU, 1>), R>(W, G, y, ys, s16, dst, nrows, nsb, stride_row, stream);    \
+        }                                                                                                     \
+    } while (0)
     switch (type) {
         case GGML_TYPE_Q4_K:   GP100_LAUNCH((gp100_mmvq_kq<GGML_TYPE_Q4_K, R, GLU>)); break;
         case GGML_TYPE_Q5_K:   GP100_LAUNCH((gp100_mmvq_kq<GGML_TYPE_Q5_K, R, GLU>)); break;
         case GGML_TYPE_IQ4_XS: GP100_LAUNCH((gp100_mmvq_iq4_xs<R, GLU>));             break;
         case GGML_TYPE_Q8_0:
             if constexpr (R <= 4) {
-                GP100_LAUNCH((gp100_mmvq_b32<GGML_TYPE_Q8_0, R, GLU>));
+                GP100_LAUNCH_B32(GGML_TYPE_Q8_0);
                 break;
             }
             GGML_ABORT("Q8_0 supports at most 4 rows per warp");
@@ -1161,30 +1213,39 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void * 
             GGML_ABORT("Q3_K supports at most 4 rows per warp");
         case GGML_TYPE_IQ4_NL:
             if constexpr (R <= 4) {
-                GP100_LAUNCH((gp100_mmvq_b32<GGML_TYPE_IQ4_NL, R, GLU>));
+                GP100_LAUNCH_B32(GGML_TYPE_IQ4_NL);
                 break;
             }
             GGML_ABORT("IQ4_NL supports at most 4 rows per warp");
         case GGML_TYPE_Q6_K:
-            if constexpr (R <= 4) {
+            if constexpr (R <= 8) {
                 GP100_LAUNCH((gp100_mmvq_q6_K<R, GLU>));
                 break;
             }
-            GGML_ABORT("Q6_K supports at most 4 rows per warp");
+            GGML_ABORT("Q6_K supports at most 8 rows per warp");
         default: GGML_ABORT("unsupported type for the GP100 MMVQ path");
     }
 #undef GP100_LAUNCH
+#undef GP100_LAUNCH_B32
 }
 
 template <bool GLU>
 static void gp100_dispatch(const ggml_type type, const void * W, const void * G, const half * y, const float2 * ys,
                            const float * s16, float * dst, const int nrows, const int nsb, const int stride_row, cudaStream_t stream) {
     int R = gp100_rows_override(nrows, GLU);
+    // The output head is the one Q6_K shape that wants 8 rows per warp rather than 4. It is 124160 rows,
+    // and -sm tensor halves its K to 2560, so each row is only 10 super-blocks: the per-row setup and
+    // epilogue dominate a very short inner loop, and it measures ~237 GB/s against ~466 for every other
+    // Q6_K tensor. Eight rows amortise that. 4 warps x 8 rows x 896 B = 28672 B of staging still fits two
+    // blocks per SM on GP100's 64 KB. Body tensors keep 4: they have long rows and want the occupancy.
+    const bool q6k_wide = type == GGML_TYPE_Q6_K && !GLU && nrows >= 32768;
     if (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q3_K) {
-        R = std::min(R, GLU ? 2 : 4); // shared staging: 4 warps x RT rows x 896 (Q6_K) or 1088 (Q8_0) bytes
+        R = std::min(R, q6k_wide ? 8 : (GLU ? 2 : 4)); // shared staging: 4 warps x RT rows x 896 (Q6_K) or 1088 (Q8_0) bytes
     }
     if (R == 0) {
-        if (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q3_K) {
+        if (q6k_wide) {
+            R = 8;
+        } else if (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q3_K) {
             R = GLU ? 2 : 4;
         } else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) {
             R = nrows < 2048 ? 1 : (GLU ? 2 : 4);
@@ -1398,4 +1459,76 @@ bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor *
         (half *) c.buf, (float2 *) (c.buf + GP100_OFF_YS), (float *) (c.buf + GP100_OFF_S16), K, eps);
     c.src1 = mul; c.data = mul->data; c.K = K; c.ncols = 1; c.epoch = ctx.graph_epoch;
     return true;
+}
+
+// Gated RMS norm per head, silu(z) * (rms_norm(x) * w), for rows of D = blockDim.x (64/128/256) floats, which
+// also fills the activation cache for the matmul that consumes it. One block per row, one warp per 32-block.
+// Replaces rms_norm_f32<256, true> + unary_gated(silu, mul) + gp100_prep_act. The row sum is reduced exactly as
+// block_reduce does it in the stock 256-thread kernel (per-warp xor butterfly, then a butterfly over the warp
+// partials padded with zeros -- the stock kernel's extra warps contribute exact zeros), and every product is
+// formed in the stock order, so the f32 output is bit-identical.
+static __global__ void gp100_gated_norm_prep(const float * __restrict__ x, const float * __restrict__ w, const float * __restrict__ z,
+                                             float * __restrict__ out, half * __restrict__ y, float2 * __restrict__ ys,
+                                             float * __restrict__ s16, const float eps) {
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    __shared__ float red[WARP_SIZE];
+    const int D   = blockDim.x;
+    const int col = threadIdx.x;
+    const int i   = blockIdx.x * D + col;
+    const int l   = col % WARP_SIZE;
+
+    const float xi = x[i];
+    float tmp = warp_reduce_sum(xi * xi);
+    if (l == 0) {
+        red[col / WARP_SIZE] = tmp;
+    }
+    __syncthreads();
+    tmp = l < D / WARP_SIZE ? red[l] : 0.0f;
+    tmp = warp_reduce_sum(tmp);
+    const float scale = rsqrtf(tmp / D + eps);
+
+    const float v = ggml_cuda_op_silu_single(z[i]) * (scale * xi * w[col]);
+    out[i] = v;
+
+    const int b = i / 32;
+    float a = fabsf(v);
+    float s = v;
+#pragma unroll
+    for (int o = 1; o < 16; o <<= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o));
+        s += __shfl_xor_sync(0xFFFFFFFF, s, o);
+    }
+    if (l % 16 == 0) {
+        s16[2 * b + l / 16] = s;
+    }
+    a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, 16));
+    s += __shfl_xor_sync(0xFFFFFFFF, s, 16);
+    int e = 0;
+    if (a > 0.0f) {
+        frexpf(a, &e);
+    }
+    const int k = 15 - e;
+    y[i] = __float2half_rn(ldexpf(v, k));
+    if (l == 0) {
+        ys[b] = make_float2(ldexpf(1.0f, 24 - k), s);
+    }
+#else
+    GGML_UNUSED_VARS(x, w, z, out, y, ys, s16, eps);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
+bool ggml_cuda_gp100_gated_norm_supported(const int64_t D, const int64_t K) {
+    return gp100_cache_enabled() && (D == 64 || D == 128 || D == 256) && K % QK_K == 0 && K <= GP100_ACT_CACHE_MAX_K;
+}
+
+void ggml_cuda_gp100_gated_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * z,
+                                ggml_tensor * out, const ggml_tensor * key, const float eps) {
+    const int64_t D = x->ne[0];
+    const int64_t K = ggml_nelements(out);
+    GGML_ASSERT(ggml_cuda_gp100_gated_norm_supported(D, K));
+    gp100_act_cache & c = gp100_cache(ctx);
+    gp100_gated_norm_prep<<<K / D, D, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (const float *) z->data,
+        (float *) out->data, (half *) c.buf, (float2 *) (c.buf + GP100_OFF_YS), (float *) (c.buf + GP100_OFF_S16), eps);
+    c.src1 = key; c.data = key->data; c.K = K; c.epoch = ctx.graph_epoch;
 }

@@ -204,3 +204,78 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// GP100, decode (one token, one sequence): conv_x = concat(get_rows(conv cache), x) is never materialised.
+// Each thread owns one channel: it reads that channel's d_conv-1 cached values from row ids[0] and the new
+// input, convolves exactly as ssm_conv_f32 does (same order, so bit-identical), then writes the shifted
+// window -- what the graph's state cpy would have written -- to state_out. A thread reads all of its
+// channel's cache values before writing any and no other thread touches them, so state_out may alias the
+// source row.
+template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+static __global__ void ssm_conv_state_f32(const float * state, const int32_t * ids, const int64_t state_row,
+                                          const float * x_new, const int64_t x_stride,
+                                          const float * w, const int64_t w_stride, const float * bias,
+                                          float * dst, float * state_out) {
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    const int64_t c  = (int64_t) blockIdx.y * split_d_inner + threadIdx.x;
+    const float * st = state + (int64_t) ids[0] * state_row + c * (d_conv - 1);
+
+    float x[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        x[j] = st[j];
+    }
+    x[d_conv - 1] = x_new[c * x_stride];
+
+    float sumf = 0.0f;
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        sumf += x[j] * w[c * w_stride + j];
+    }
+    sumf += bias != nullptr ? bias[c] : 0.0f;
+    dst[c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+
+    float * so = state_out + c * (d_conv - 1);
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        so[j] = x[j + 1];
+    }
+#else
+    GGML_UNUSED_VARS(state, ids, state_row, x_new, x_stride, w, w_stride, bias, dst, state_out);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
+void ggml_cuda_op_ssm_conv_gp100_state(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node,
+                                       ggml_tensor * silu_dst, const ggml_cuda_ssm_conv_state & st) {
+    const ggml_tensor * w    = dst->src[1];
+    const ggml_tensor * bias = bias_add_node ? (bias_add_node->src[0] == dst ? bias_add_node->src[1] : bias_add_node->src[0]) : nullptr;
+    const ggml_tensor * out  = silu_dst ? silu_dst : dst;
+
+    const int64_t nc = w->ne[0];
+    const int64_t nr = out->ne[0];
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0 && w->nb[0] == sizeof(float) && out->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias == nullptr || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_nelements(bias) == nr));
+
+    const dim3 blocks(1, nr / threads, 1);
+    const float * bias_d = bias ? (const float *) bias->data : nullptr;
+    cudaStream_t stream = ctx.stream();
+
+    auto launch = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        if (silu_dst) {
+            ssm_conv_state_f32<true, threads, kNC><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride,
+                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out);
+        } else {
+            ssm_conv_state_f32<false, threads, kNC><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride,
+                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out);
+        }
+    };
+    switch (nc) {
+        case 3:  launch(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch(std::integral_constant<int, 5 >{}); break;
+        default: GGML_ABORT("ssm_conv_gp100_state: unsupported kernel size");
+    }
+}

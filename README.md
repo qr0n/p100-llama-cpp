@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0008`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0009`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -22,6 +22,7 @@ What you get depends on your setup:
 | your setup | what applies | expect |
 |---|---|---|
 | any P100 (sm_60), quantized model | `0007` + `0008` | fp16 matrix-vector path: **Llama-3.1-8B Q4_K_M tg 39.3 -> 79.6, i.e. 2.03x**; qwen3.8-27b tg 25.0 -> 33.7 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
+| any P100, Qwen3.8 / Qwen3-Next style gated delta-net model | `0009` (on top of `0007`/`0008`) | the recurrent-state plumbing folded into its kernels: **qwen3.8-27b real-use decode 32.3 -> 35.3 tok/s (+9.1%)**, 480 fewer kernel launches per token, output bit-identical — see [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md) |
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
 | two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
@@ -109,6 +110,18 @@ Qwen3.8-27B is 45% Q5_K at 427 GB/s and 18% IQ4_XS at 346, and pays a cross-card
 AllReduce that a single-card model does not. **The closer your mix is to plain
 Q4_K, the bigger the win.** It is also *more* accurate than stock, not less — the
 path it replaces quantised the activations to 8 bits.
+
+Patch `0009` goes after what is left once the matrix-vector path is fast: the
+kernels *between* the matmuls. In Qwen3.8-27B's 48 gated delta-net layers, each
+decode step ran ten small kernels per layer just to copy the recurrent state out of
+the cache, rebuild the conv window, normalise q/k and apply two activations — each
+2-9 us of mostly launch latency on GP100. `0009` folds them into the kernels that
+already read the data. Every fused result is **bit-identical** (decode-path KLD
+against a Q8_0 reference unchanged in every digit), and real-use decode goes
+**32.30 -> 35.25 tok/s**, uniformly from 42-token to 11k-token prompts. The
+write-up includes the one trap worth knowing before you fuse anything in a ggml
+graph: skipping a node changes what the allocator thinks is still alive — a version
+that ignored that was 1.7% faster and wrong. [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md)
 
 `0001` and `0002` are 61 added lines across two files: one architecture-neutral,
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and

@@ -1,18 +1,17 @@
 From dbe92b188cb499e5f069ad546ce611882b7d8218 Mon Sep 17 00:00:00 2001
-From: Kmic-68 <Kmic-68@users.noreply.github.com>
+From: qr0n <77075118+qr0n@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 23:10:31 +0000
-Subject: [PATCH 10/11] CUDA: pre-Volta long-context flash attention (by
- Kmic-68)
+Subject: [PATCH 10/11] CUDA: pre-Volta long-context flash attention (code from
+ Kmic-68's fork)
 
-Work by Kmic-68, from https://github.com/Kmic-68/llama.cpp, applied here as
-patch 0010-kmic-long-context-fattn.patch:
+Based on code from Kmic-68's fork, https://github.com/Kmic-68/llama.cpp.
+The credit for this work is his; the patch was prepared from that repo by
+qr0n and is applied unchanged here:
 
 - cuBLAS-GEMM flash attention for long-context prefill on pre-Volta
   (fattn-gemm.cu; Q >= 128 tokens, KV >= 4096; GGML_CUDA_FA_GEMM=0 disables)
 - GQA-6 tile configs and a GQA-folded vec kernel (Qwen3.8-27B under -sm tensor)
 - q4_0 K/V dequantized straight into the tile kernel's shared tile
-
-Applied by qr0n.
 ---
  ggml/src/ggml-cuda/fattn-gemm.cu  | 670 ++++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/fattn-gemm.cuh |   9 +

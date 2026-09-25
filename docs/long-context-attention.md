@@ -1,9 +1,10 @@
-# Patch 0010: long-context flash attention for pre-Volta (by Kmic-68)
+# Patch 0010: long-context flash attention for pre-Volta (code from Kmic-68's fork)
 
-**This patch is [Kmic-68](https://github.com/Kmic-68)'s work, from
-[github.com/Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp).** It is
-included here unchanged as `0010` (commit author: Kmic-68). The explanations below
-summarise his code comments; the measurements are ours, taken on this repo's box.
+**The code in this patch is [Kmic-68](https://github.com/Kmic-68)'s work, from his
+fork [github.com/Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp).** The
+patch itself was prepared from that repo by qr0n; Kmic-68 did not write or submit
+it. The explanations below summarise his code comments; the measurements are ours,
+taken on this repo's box.
 
 Pascal has no tensor cores, so long-context attention runs on llama.cpp's
 `flash_attn_tile` kernel, far below what the card's fp16 units can do. `0010`

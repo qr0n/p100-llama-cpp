@@ -23,7 +23,7 @@ What you get depends on your setup:
 |---|---|---|
 | any P100 (sm_60), quantized model | `0007` + `0008` | fp16 matrix-vector path: **Llama-3.1-8B Q4_K_M tg 39.3 -> 79.6, i.e. 2.03x**; qwen3.8-27b tg 25.0 -> 33.7 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
 | any P100, several sequences at once (`llama-server --parallel N`, concurrent agents) | `0011` (on top of `0007`-`0009`) | batched decode on the fp16 and fused paths: **qwen3.8-27b, 4 concurrent agents 16.0 -> 20.3 tok/s each (58.7 -> 72.9 aggregate)**, one agent unchanged — see [`docs/concurrent-decode.md`](docs/concurrent-decode.md) |
-| any pre-Volta card, long context | `0010`, **by [Kmic-68](https://github.com/Kmic-68/llama.cpp)** | cuBLAS-GEMM flash attention for long prefill plus GQA-6 tile kernels: **qwen3.8-27b pp2048 at 32k depth 285.6 -> 352.9 (+23.6%)**, perplexity unchanged — see [`docs/long-context-attention.md`](docs/long-context-attention.md) |
+| any pre-Volta card, long context | `0010`, **code from [Kmic-68's fork](https://github.com/Kmic-68/llama.cpp)** | cuBLAS-GEMM flash attention for long prefill plus GQA-6 tile kernels: **qwen3.8-27b pp2048 at 32k depth 285.6 -> 352.9 (+23.6%)**, perplexity unchanged — see [`docs/long-context-attention.md`](docs/long-context-attention.md) |
 | any P100, Qwen3.8 / Qwen3-Next style gated delta-net model | `0009` (on top of `0007`/`0008`) | the recurrent-state plumbing folded into its kernels: **qwen3.8-27b real-use decode 32.3 -> 35.3 tok/s (+9.1%)**, 480 fewer kernel launches per token, output bit-identical — see [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md) |
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
@@ -125,9 +125,9 @@ write-up includes the one trap worth knowing before you fuse anything in a ggml
 graph: skipping a node changes what the allocator thinks is still alive — a version
 that ignored that was 1.7% faster and wrong. [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md)
 
-Patch `0010` is **[Kmic-68](https://github.com/Kmic-68)'s work**
-([github.com/Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp)), included
-unchanged with his authorship. It gives Pascal a cuBLAS-GEMM flash attention for
+The code in patch `0010` is **[Kmic-68](https://github.com/Kmic-68)'s work**, from
+his fork [github.com/Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp); the
+patch was prepared from that repo by qr0n. It gives Pascal a cuBLAS-GEMM flash attention for
 long prefill, where the tile kernel reaches a fraction of the card's fp16 rate. It
 also adds tile kernels that fold all 6 query heads per KV head that Qwen3.8-27B has
 under `-sm tensor`. Here that is **+23.6% prompt processing at 32k depth** with

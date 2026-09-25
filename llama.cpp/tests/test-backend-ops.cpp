@@ -9175,6 +9175,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t ncols = 2; ncols <= 8; ncols++) { // speculative-decoding verification batches
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, ncols, 1280, {1, 1}, {1, 1}));
         }
+        for (int nseq : {2, 4, 8}) { // one token per sequence, activations shaped [K, 1, n_seqs] (qwen35 ssm_out)
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, 1, 1280, {1, 1}, {nseq, 1}));
+        }
     }
 
 
@@ -10384,6 +10387,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Long-context prefill attention, exactly as one GPU sees it for qwen3.5-27B under
+    // -sm tensor -ctk q4_0 -ctv q4_0 -ub 2048: 2 KV heads, GQA 6 (12 Q heads), D 256.
+    // 16 of the 65 layers carry a growing KV cache (full_attention_interval 4), so a
+    // prefill batch costs 16x one of these. Benchmarking the op directly avoids the ~30
+    // minutes llama-bench spends rebuilding 262144 tokens of context to time one batch.
+    for (int kv : {32768, 65536, 131072, 262144}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    }
+    // Decode shape across the 32-value block quants, to separate "bytes moved" from "work per
+    // value" without a profiler (nvprof metrics need NVreg_RestrictProfilingToAdminUsers=0).
+    // All of these hold 32 values per block, so a call touches the same number of blocks and
+    // values; only the block size and the dequant differ:
+    //     q4_0 18 B (0.5625 B/val)  q4_1 20 B  q5_0 22 B  q5_1 24 B  q8_0 34 B (1.0625)  f16 2 B/val
+    // If time tracks bytes, the kernel is bandwidth-bound. If it is flat across these while
+    // f16 is faster than all of them, the cost is per-value unpacking, not traffic. q8_0 is
+    // the key point: ~2x the bytes of q4_0 with the cheapest dequant (no nibble unpack).
+    for (ggml_type tkv : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

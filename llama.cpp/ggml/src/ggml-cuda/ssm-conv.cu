@@ -205,43 +205,56 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     }
 }
 
-// GP100, decode (one token, one sequence): conv_x = concat(get_rows(conv cache), x) is never materialised.
-// Each thread owns one channel: it reads that channel's d_conv-1 cached values from row ids[0] and the new
-// input, convolves exactly as ssm_conv_f32 does (same order, so bit-identical), then writes the shifted
-// window -- what the graph's state cpy would have written -- to state_out. A thread reads all of its
-// channel's cache values before writing any and no other thread touches them, so state_out may alias the
-// source row.
-template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+// GP100, decode (one token per sequence, up to SSM_CONV_STATE_MAX_SEQS sequences): conv_x = concat(get_rows(conv
+// cache), x) is never materialised. Each thread owns one channel in every sequence: it reads that channel's d_conv-1
+// cached values from rows ids[s] and the new inputs, convolves exactly as ssm_conv_f32 does (same order, so
+// bit-identical), then writes the shifted windows -- what the graph's state cpy would have written -- to state_out.
+// A thread reads all of its channel's cache values, in every sequence, before writing any, and no other thread
+// touches them, so state_out may alias the source rows (including another sequence's row after the recurrent
+// memory reorders cells).
+#define SSM_CONV_STATE_MAX_SEQS 8
+template <bool apply_silu, size_t split_d_inner, size_t d_conv, int NS>
 static __global__ void ssm_conv_state_f32(const float * state, const int32_t * ids, const int64_t state_row,
-                                          const float * x_new, const int64_t x_stride,
+                                          const float * x_new, const int64_t x_stride, const int64_t x_seq_stride,
                                           const float * w, const int64_t w_stride, const float * bias,
-                                          float * dst, float * state_out) {
+                                          float * dst, float * state_out, const int n_seqs, const int64_t C) {
 #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    // NS: most sequences this instance handles (1 keeps the one-sequence kernel as lean as before)
     const int64_t c  = (int64_t) blockIdx.y * split_d_inner + threadIdx.x;
-    const float * st = state + (int64_t) ids[0] * state_row + c * (d_conv - 1);
 
-    float x[d_conv];
+    float x[NS][d_conv];
 #pragma unroll
-    for (size_t j = 0; j < d_conv - 1; j++) {
-        x[j] = st[j];
+    for (int s = 0; s < NS; s++) {
+        if (s < n_seqs) {
+            const float * st = state + (int64_t) ids[s] * state_row + c * (d_conv - 1);
+#pragma unroll
+            for (size_t j = 0; j < d_conv - 1; j++) {
+                x[s][j] = st[j];
+            }
+            x[s][d_conv - 1] = x_new[c * x_stride + s * x_seq_stride];
+        }
     }
-    x[d_conv - 1] = x_new[c * x_stride];
 
-    float sumf = 0.0f;
 #pragma unroll
-    for (size_t j = 0; j < d_conv; j++) {
-        sumf += x[j] * w[c * w_stride + j];
-    }
-    sumf += bias != nullptr ? bias[c] : 0.0f;
-    dst[c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    for (int s = 0; s < NS; s++) {
+        if (s < n_seqs) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (size_t j = 0; j < d_conv; j++) {
+                sumf += x[s][j] * w[c * w_stride + j];
+            }
+            sumf += bias != nullptr ? bias[c] : 0.0f;
+            dst[s * C + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
 
-    float * so = state_out + c * (d_conv - 1);
+            float * so = state_out + (s * C + c) * (d_conv - 1);
 #pragma unroll
-    for (size_t j = 0; j < d_conv - 1; j++) {
-        so[j] = x[j + 1];
+            for (size_t j = 0; j < d_conv - 1; j++) {
+                so[j] = x[s][j + 1];
+            }
+        }
     }
 #else
-    GGML_UNUSED_VARS(state, ids, state_row, x_new, x_stride, w, w_stride, bias, dst, state_out);
+    GGML_UNUSED_VARS(state, ids, state_row, x_new, x_stride, x_seq_stride, w, w_stride, bias, dst, state_out, n_seqs, C);
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 }
@@ -255,21 +268,33 @@ void ggml_cuda_op_ssm_conv_gp100_state(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t nc = w->ne[0];
     const int64_t nr = out->ne[0];
     const int threads = 128;
-    GGML_ASSERT(nr % threads == 0 && w->nb[0] == sizeof(float) && out->type == GGML_TYPE_F32);
+    const int n_seqs = (int) out->ne[2];
+    GGML_ASSERT(nr % threads == 0 && w->nb[0] == sizeof(float) && out->type == GGML_TYPE_F32 && ggml_is_contiguous(out));
+    GGML_ASSERT(out->ne[1] == 1 && out->ne[3] == 1 && n_seqs >= 1 && n_seqs <= SSM_CONV_STATE_MAX_SEQS);
     GGML_ASSERT(bias == nullptr || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_nelements(bias) == nr));
 
     const dim3 blocks(1, nr / threads, 1);
     const float * bias_d = bias ? (const float *) bias->data : nullptr;
     cudaStream_t stream = ctx.stream();
 
-    auto launch = [&](auto NC) {
+    auto launch_ns = [&](auto NC, auto NS) {
         constexpr int kNC = decltype(NC)::value;
+        constexpr int kNS = decltype(NS)::value;
         if (silu_dst) {
-            ssm_conv_state_f32<true, threads, kNC><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride,
-                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out);
+            ssm_conv_state_f32<true, threads, kNC, kNS><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride, st.x_seq_stride,
+                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out, n_seqs, nr);
         } else {
-            ssm_conv_state_f32<false, threads, kNC><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride,
-                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out);
+            ssm_conv_state_f32<false, threads, kNC, kNS><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride, st.x_seq_stride,
+                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out, n_seqs, nr);
+        }
+    };
+    auto launch = [&](auto NC) {
+        if (n_seqs == 1) {
+            launch_ns(NC, std::integral_constant<int, 1>{});
+        } else if (n_seqs <= 4) {
+            launch_ns(NC, std::integral_constant<int, 4>{});
+        } else {
+            launch_ns(NC, std::integral_constant<int, SSM_CONV_STATE_MAX_SEQS>{});
         }
     };
     switch (nc) {

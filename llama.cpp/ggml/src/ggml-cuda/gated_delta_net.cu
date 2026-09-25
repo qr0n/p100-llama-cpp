@@ -1,7 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
-template <int S_v, bool KDA, bool keep_rs_t, bool gather_t, bool l2_qk_t, bool ab_t>
+template <int S_v, bool KDA, bool keep_rs_t, bool gather_t, bool l2_qk_t, bool ab_t, bool ms_t = false>
 static __device__ __forceinline__ void gated_delta_net_body(const float * q,
                                      const float * k,
                                      const float * v,
@@ -29,12 +29,14 @@ static __device__ __forceinline__ void gated_delta_net_body(const float * q,
                                      int           K,
                                      const int32_t * s_ids,
                                      int64_t       s_row,
-                                     float         l2_eps) {
+                                     float         l2_eps,
+                                     int           ms_cols = 0) {
     const uint32_t h_idx    = blockIdx.x;
-    const uint32_t sequence = blockIdx.y;
-    // each warp owns one column, using warp-level primitives to reduce across rows
+    // each warp owns one column, using warp-level primitives to reduce across rows (ms_t: one column of one
+    // sequence, the block spanning ms_cols columns of every sequence)
+    const uint32_t sequence = ms_t ? threadIdx.y / ms_cols : blockIdx.y;
     const int      lane     = threadIdx.x;
-    const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
+    const int      col      = ms_t ? blockIdx.z * ms_cols + threadIdx.y % ms_cols : blockIdx.z * blockDim.y + threadIdx.y;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
@@ -67,6 +69,11 @@ static __device__ __forceinline__ void gated_delta_net_body(const float * q,
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
         s_shard[r]  = curr_state[i];
+    }
+    if constexpr (ms_t) {
+        __syncthreads(); // every state row of these columns is read before any is written
+    } else {
+        GGML_UNUSED(ms_cols);
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -233,6 +240,28 @@ __global__ void GDN_LAUNCH_BOUNDS gated_delta_net_gather_cuda(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 }
 
+// GP100 only, batched decode (n_seqs in 2..GDN_GATHER_MAX_SEQS, one token each, scalar gate): the recurrent state
+// is read in place from cache rows s_ids[seq]. A block covers `cols` state columns of one head in EVERY sequence
+// (one warp per column and sequence), and it barriers after the state loads, so every source row is read before
+// any destination row is written: no other block touches those columns, and a source row that is also another
+// sequence's destination (cells reordered by the recurrent memory) is safe. The body is gated_delta_net_body.
+template <int S_v, bool keep_rs_t, bool l2_qk_t, bool ab_t>
+__global__ void __launch_bounds__(256) gated_delta_net_gather_ms_cuda(
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * curr_state, float * dst, float * state, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3, const uint3 neqk1_magic, const uint3 rq3_magic,
+        float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row, float l2_eps, int cols) {
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    gated_delta_net_body<S_v, false, keep_rs_t, true, l2_qk_t, ab_t, true>(q, k, v, g, beta, curr_state, dst, state, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row, l2_eps, cols);
+#else
+    GGML_UNUSED_VARS(q, k, v, g, beta, curr_state, dst, state, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row, l2_eps, cols);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net_sv(
         const ggml_cuda_kernel_launch_params & launch_params,
@@ -246,6 +275,27 @@ static void launch_gated_delta_net_sv(
         const uint3 neqk1_magic, const uint3 rq3_magic,
         float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row, bool l2_qk, float l2_eps,
         bool ab) {
+    if constexpr (!KDA) {
+        if (s_ids != nullptr && n_seqs > 1) {
+            // one block per (head, column group) for all sequences: see gated_delta_net_gather_ms_cuda
+            const int cols = n_seqs <= 2 ? 4 / (int) n_seqs : 1; // cols * n_seqs warps <= 8
+            ggml_cuda_kernel_launch_params lp = launch_params;
+            lp.block_nums = dim3(H, 1, S_v / cols);
+            lp.block_dims = dim3(launch_params.block_dims.x, cols * n_seqs, 1);
+#define GDN_MS(L2, AB) ggml_cuda_kernel_launch(gated_delta_net_gather_ms_cuda<S_v, keep_rs_t, L2, AB>, lp, \
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row, l2_eps, cols)
+            if (l2_qk && ab) {
+                GDN_MS(true, true);
+            } else if (l2_qk) {
+                GDN_MS(true, false);
+            } else {
+                GDN_MS(false, false);
+            }
+#undef GDN_MS
+            return;
+        }
+    }
     if (s_ids != nullptr && l2_qk && ab) {
         ggml_cuda_kernel_launch(gated_delta_net_gather_cuda<S_v, KDA, keep_rs_t, true, true>, launch_params,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
@@ -317,10 +367,14 @@ const ggml_tensor * ggml_cuda_gdn_state_gather(const ggml_tensor * gdn) {
     }
     const ggml_tensor * src_v = gdn->src[2];
     const ggml_tensor * s     = gdn->src[5];
-    const int64_t S_v = src_v->ne[0], H = src_v->ne[1], n_seqs = src_v->ne[3];
-    // one sequence: every thread then reads exactly the state elements it later writes, and no other
-    // block reads them, so the cache row may double as the kernel's input even when it is also the output
-    if (n_seqs != 1 || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s)) {
+    const int64_t S_v = src_v->ne[0], H = src_v->ne[1], n_tokens = src_v->ne[2], n_seqs = src_v->ne[3];
+    // One sequence: every thread reads exactly the state elements it later writes, and no other block reads
+    // them, so the cache row may double as the kernel's input even when it is also the output.
+    // Several sequences, one token each (batched decode): gated_delta_net_gather_ms_cuda gives each thread its
+    // state elements in EVERY sequence and has it read all source rows before writing any destination row, so
+    // a source row that is another sequence's destination (cells reordered by the recurrent memory) is safe too.
+    const bool multi = n_seqs > 1 && n_seqs <= GDN_GATHER_MAX_SEQS && n_tokens == 1 && gdn->src[3]->ne[0] == 1;
+    if ((n_seqs != 1 && !multi) || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s)) {
         return nullptr;
     }
     const ggml_tensor * rows = s->view_src ? s->view_src : s;
@@ -330,10 +384,10 @@ const ggml_tensor * ggml_cuda_gdn_state_gather(const ggml_tensor * gdn) {
     const ggml_tensor * states = rows->src[0];
     const ggml_tensor * ids    = rows->src[1];
     if (rows->op != GGML_OP_GET_ROWS || rows->type != GGML_TYPE_F32 || !ggml_is_contiguous(rows) ||
-        rows->ne[0] != S_v * S_v * H || rows->ne[1] != 1 || rows->ne[2] != 1 || rows->ne[3] != 1 ||
+        rows->ne[0] != S_v * S_v * H || rows->ne[1] != n_seqs || rows->ne[2] != 1 || rows->ne[3] != 1 ||
         states->type != GGML_TYPE_F32 || states->nb[0] != sizeof(float) || states->ne[0] != rows->ne[0] ||
         states->nb[1] % sizeof(float) != 0 || states->ne[2] != 1 || states->ne[3] != 1 ||
-        ids->type != GGML_TYPE_I32 || ids->ne[0] != 1 || states->data == nullptr || ids->data == nullptr) {
+        ids->type != GGML_TYPE_I32 || ids->ne[0] != n_seqs || states->data == nullptr || ids->data == nullptr) {
         return nullptr;
     }
     return rows;
@@ -349,8 +403,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
     ggml_tensor * src_state = dst->src[5];
 
     // GP100: read the recurrent state in place from the cache row (see ggml_cuda_gdn_state_gather)
+    // Only when the graph evaluation has proven that nothing overwrites the cache rows before this node runs.
     const ggml_tensor * gather = nullptr;
-    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL) {
+    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL && ctx.gp100_gdn_gather == dst) {
         gather = ggml_cuda_gdn_state_gather(dst);
     }
     const int32_t * s_ids = gather ? (const int32_t *) gather->src[1]->data : nullptr;

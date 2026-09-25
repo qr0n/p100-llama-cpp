@@ -2,6 +2,9 @@
 #include "ggml.h"
 
 // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
+// GP100 in-place state read: most sequences one batched-decode step may carry
+#define GDN_GATHER_MAX_SEQS 8
+
 struct ggml_cuda_gated_delta_net_fused_cache {
     float * data;        // rollback slot 0
     int64_t slot_stride; // between rollback slots (0 when K==1)

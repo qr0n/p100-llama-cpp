@@ -328,7 +328,11 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_kq_nc(
                 }
                 const float sl = __half2float(__hadd(__low2half(al), __high2half(al)));
                 const float sh = __half2float(__hadd(__low2half(ah), __high2half(ah)));
-                sum[r][c] += fmaf(sc0 * s4.x, sl, sc1 * s4.z * sh) - fmaf(m0, s4.y, m1 * s4.w);
+                float acc = sum[r][c];
+                acc = fmaf(sc0, sl * s4.x, acc);
+                acc = fmaf(sc1, sh * s4.z, acc);
+                acc = fmaf(-m0, s4.y, acc);
+                sum[r][c] = fmaf(-m1, s4.w, acc);
             }
         }
     }
@@ -719,6 +723,9 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_nc(
     for (int it = 0; it < nit; it++) {
         const int  sb   = 4 * it + g;
         const bool act  = sb < nsb;
+        // activation reads use a clamped super-block so they are unconditional (identical for every row, so the
+        // compiler loads them once per column rather than once per row); act gates only the accumulation
+        const int  sbc  = act ? sb : nsb - 1;
         const int  nblk = min(nsb - 4 * it, 4);
 
         int m[RT];
@@ -742,19 +749,18 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_nc(
         }
         __syncwarp();
 
-        const uint4 zero4 = make_uint4(0, 0, 0, 0);
         // per-column scales and -32 offsets do not depend on the row: load them once per iteration
         float rsc[NC][4], soc[NC][4];
 #pragma unroll
         for (int c = 0; c < NC; c++) {
             const float2 * ysc = ys + (int64_t) c * (K / 32);
-            const float4 rs01 = act ? __ldg((const float4 *) (ysc + sb * 8 + 4 * n))     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            const float4 rs23 = act ? __ldg((const float4 *) (ysc + sb * 8 + 4 * n + 2)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float4 rs01 = __ldg((const float4 *) (ysc + sbc * 8 + 4 * n));
+            const float4 rs23 = __ldg((const float4 *) (ysc + sbc * 8 + 4 * n + 2));
             rsc[c][0] = rs01.x; rsc[c][1] = rs01.z; rsc[c][2] = rs23.x; rsc[c][3] = rs23.z;
-            const float * sp = s16 + (int64_t) c * (K / 16) + sb * 16 + 8 * n + i0;
+            const float * sp = s16 + (int64_t) c * (K / 16) + sbc * 16 + 8 * n + i0;
 #pragma unroll
             for (int mm = 0; mm < 4; mm++) {
-                soc[c][mm] = act ? __ldg(sp + 2 * mm) * offm : 0.0f;
+                soc[c][mm] = __ldg(sp + 2 * mm) * offm;
             }
         }
 #pragma unroll
@@ -794,8 +800,8 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_nc(
             const float dd = __half2float(__ushort_as_half((unsigned short) (DW & 0xFFFF)));
 #pragma unroll
             for (int c = 0; c < NC; c++) {
-                const uint4 * yp = (const uint4 *) (y + (int64_t) c * K + sb * 256 + 128 * n + 8 * c4);
-                const uint4 yv[4] = {act ? __ldg(yp) : zero4, act ? __ldg(yp + 4) : zero4, act ? __ldg(yp + 8) : zero4, act ? __ldg(yp + 12) : zero4};
+                const uint4 * yp = (const uint4 *) (y + (int64_t) c * K + sbc * 256 + 128 * n + 8 * c4);
+                const uint4 yv[4] = {__ldg(yp), __ldg(yp + 4), __ldg(yp + 8), __ldg(yp + 12)};
                 float sacc = 0.0f;
 #pragma unroll
                 for (int mm = 0; mm < 4; mm++) {
@@ -1096,6 +1102,14 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 }
 
+// Columns of a matmul operand: its rows, or its ne[2] when it is [K, 1, n] (one token per sequence), else 0.
+static int64_t gp100_ncols(const ggml_tensor * t) {
+    return t->ne[2] == 1 ? t->ne[1] : (t->ne[1] == 1 ? t->ne[2] : 0);
+}
+static int64_t gp100_col_stride(const ggml_tensor * t) {
+    return (t->ne[2] == 1 ? t->nb[1] : t->nb[2]) / sizeof(float);
+}
+
 bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
                                     const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
     if (cc != GGML_CUDA_CC_PASCAL || GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_MTHREADS(cc)) {
@@ -1124,16 +1138,18 @@ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, cons
         default:
             return false;
     }
-    // 1 column (all types above), or 2..8 columns (Q4_K/Q5_K/IQ4_XS, no fusion): plain 2D, contiguous rows
-    const int64_t ncols = src1->ne[1];
-    if (ncols < 1 || ncols > 8 || dst->ne[1] != ncols ||
+    // 1 column (all types above), or 2..8 columns (Q4_K/Q5_K/IQ4_XS, no fusion). The columns are either src1's
+    // rows (ne[1]) or, for one-token-per-sequence batches shaped [K, 1, n_seqs] (qwen35's ssm_out), its ne[2].
+    const int64_t ncols = gp100_ncols(src1);
+    if (ncols < 1 || ncols > 8 || gp100_ncols(dst) != ncols || src1->ne[1] != dst->ne[1] ||
         (ncols > 1 && (fusion || (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
-                                  src0->type != GGML_TYPE_IQ4_XS)))) {
-        // Q6_K has a multi-column kernel (gp100_mmvq_q6_K_nc) but it loses to the generic int8 path at 5 columns
-        // in situ (7.68 vs 6.18 ms per verify batch), so Q6_K batches stay generic
+                                  src0->type != GGML_TYPE_IQ4_XS && !(src0->type == GGML_TYPE_Q6_K && ncols <= 4))))) {
+        // Q6_K's multi-column kernel (gp100_mmvq_q6_K_nc) loses to the generic int8 path at 5 columns in situ
+        // (7.68 vs 6.18 ms per MTP verify batch) but wins at 4 concurrent sequences (batched decode 73.1 -> 74.2
+        // tok/s aggregate), so it takes 2..4 columns only
         return false;
     }
-    return src1->ne[2] == 1 && src1->ne[3] == 1 && dst->nb[0] == sizeof(float) &&
+    return src1->ne[3] == 1 && dst->nb[0] == sizeof(float) &&
            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
            src0->ne[0] % QK_K == 0 && src0->nb[1] % 2 == 0 && (uintptr_t) src0->data % 16 == 0 &&
            (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->nb[1] % 16 == 0); // Q6_K/Q3_K are staged
@@ -1261,15 +1277,15 @@ static void gp100_dispatch(const ggml_type type, const void * W, const void * G,
     }
 }
 
-// 2..8 columns. R x NC accumulators per thread: R = 4 up to 2 columns, 2 up to 4, then 1.
+// 2..8 columns: 4 rows per warp, R x NC accumulators per thread. In situ at 4 columns (batched decode, tok/s
+// aggregate): R=1 42.8, R=2 62.3, R=4 74.3, R=8 66.9.
 template <ggml_type type, int NC>
 static void gp100_launch_nc(const void * W, const half * y, const float2 * ys, const float * s16, float * dst, const int nrows, const int nsb,
                             const int stride_row, const int stride_dst, cudaStream_t stream) {
     constexpr int R = 4;
     const int nblocks = (nrows + 4*R - 1) / (4*R);
     if constexpr (type == GGML_TYPE_Q6_K) {
-        constexpr int R6 = 4;
-        gp100_mmvq_q6_K_nc<R6, NC><<<(nrows + 4*R6 - 1) / (4*R6), 128, 0, stream>>>(W, y, ys, s16, dst, nrows, nsb, stride_row, stride_dst);
+        gp100_mmvq_q6_K_nc<R, NC><<<nblocks, 128, 0, stream>>>(W, y, ys, s16, dst, nrows, nsb, stride_row, stride_dst);
     } else if constexpr (type == GGML_TYPE_IQ4_XS) {
         gp100_mmvq_iq4_xs_nc<R, NC><<<nblocks, 128, 0, stream>>>(W, y, ys, dst, nrows, nsb, stride_row, stride_dst);
     } else {
@@ -1339,7 +1355,7 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     cudaStream_t stream = ctx.stream();
     const int64_t K     = src0->ne[0];
     const int64_t nrows = src0->ne[1];
-    const int     ncols = src1->ne[1];
+    const int     ncols = gp100_ncols(src1);
     const int     nb32  = K / 32;
 
     ggml_cuda_pool_alloc<char> tmp(ctx.pool());
@@ -1358,13 +1374,13 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     float  * s16 = (float  *) (base + GP100_OFF_S16);
     if (!hit) {
         const int nblk = nb32 * ncols;
-        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, src1->nb[1] / sizeof(float));
+        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, gp100_col_stride(src1));
     }
 
     const int nsb        = K / QK_K;
     const int stride_row = src0->nb[1] / ggml_type_size(src0->type);
     if (ncols > 1) {
-        gp100_dispatch_nc(src0->type, src0->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, ncols, dst->nb[1] / sizeof(float), stream);
+        gp100_dispatch_nc(src0->type, src0->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, ncols, gp100_col_stride(dst), stream);
     } else if (fusion) {
         gp100_dispatch<true >(src0->type, src0->data, fusion->gate->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, stream);
     } else {
@@ -1379,9 +1395,15 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 // the following matmuls skip their own conversion.
 static __global__ void gp100_rms_norm_mul_prep(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ out,
                                                half * __restrict__ y, float2 * __restrict__ ys, float * __restrict__ s16,
-                                               const int K, const float eps) {
+                                               const int K, const float eps, const int64_t x_stride) {
 #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
     __shared__ float red[4];
+    // row blockIdx.y (one per sequence in a batched decode): its own input row, output column and cache column
+    x   += blockIdx.y * x_stride;
+    out += blockIdx.y * K;
+    y   += blockIdx.y * K;
+    ys  += blockIdx.y * (K / 32);
+    s16 += blockIdx.y * (K / 16);
     const float4 * x4 = (const float4 *) x;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < K / 4; i += blockDim.x) {
@@ -1429,12 +1451,12 @@ static __global__ void gp100_rms_norm_mul_prep(const float * __restrict__ x, con
         ys[b] = make_float2(ldexpf(1.0f, 24 - k), s);
     }
 #else
-    GGML_UNUSED_VARS(x, w, out, y, ys, s16, K, eps);
+    GGML_UNUSED_VARS(x, w, out, y, ys, s16, K, eps, x_stride);
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 }
 
-bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul) {
+bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, const bool multi_row) {
     static const bool disabled = getenv("GGML_CUDA_GP100_NO_NORM_FUSION") != nullptr;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (disabled || cc != GGML_CUDA_CC_PASCAL || !gp100_cache_enabled()) {
@@ -1443,11 +1465,14 @@ bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor *
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
     const int64_t K = x->ne[0];
-    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
-        ggml_nrows(x) != 1 || ggml_nrows(w) != 1 || w->ne[0] != K || ggml_nrows(mul) != 1 || mul->ne[0] != K ||
-        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) || !ggml_is_contiguous(mul) ||
-        K % QK_K != 0 || K > GP100_ACT_CACHE_MAX_K ||
-        (uintptr_t) x->data % 16 != 0) {
+    // one row, or (multi_row: the caller found a matmul reading the result) one row per sequence of a batched
+    // decode, up to the 8 columns the matmuls take
+    const int64_t nrows = ggml_nrows(x);
+    if ((nrows > 1 && !multi_row) || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        nrows < 1 || nrows > 8 || ggml_nrows(w) != 1 || w->ne[0] != K || ggml_nrows(mul) != nrows || mul->ne[0] != K ||
+        !ggml_is_contiguous_rows(x) || x->ne[3] != 1 || gp100_ncols(x) != nrows || !ggml_is_contiguous(w) || !ggml_is_contiguous(mul) ||
+        gp100_ncols(mul) != nrows || K % QK_K != 0 || K * nrows > GP100_ACT_CACHE_MAX_K ||
+        (uintptr_t) x->data % 16 != 0 || gp100_col_stride(x) % 4 != 0) {
         return false;
     }
     float eps;
@@ -1455,9 +1480,9 @@ bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     gp100_act_cache & c = gp100_cache(ctx);
     const int nb32 = K / 32;
-    gp100_rms_norm_mul_prep<<<(nb32 + 3) / 4, 128, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul->data,
-        (half *) c.buf, (float2 *) (c.buf + GP100_OFF_YS), (float *) (c.buf + GP100_OFF_S16), K, eps);
-    c.src1 = mul; c.data = mul->data; c.K = K; c.ncols = 1; c.epoch = ctx.graph_epoch;
+    gp100_rms_norm_mul_prep<<<dim3((nb32 + 3) / 4, nrows), 128, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul->data,
+        (half *) c.buf, (float2 *) (c.buf + GP100_OFF_YS), (float *) (c.buf + GP100_OFF_S16), K, eps, gp100_col_stride(x));
+    c.src1 = mul; c.data = mul->data; c.K = K; c.ncols = nrows; c.epoch = ctx.graph_epoch;
     return true;
 }
 

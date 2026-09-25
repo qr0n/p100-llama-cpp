@@ -12,7 +12,8 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
 // Fused RMS_NORM * weight for a single row that also fills the GP100 activation cache for the matmuls that
 // consume it. Returns false (nothing launched) when not applicable.
-bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul);
+// multi_row: several rows (a batched decode's sequences) are allowed; the caller sets it only when a matmul reads mul
+bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, bool multi_row);
 
 // Gated per-head RMS norm, out = silu(z) * (rms_norm(x) * w) over rows of D = x->ne[0] (64/128/256), writing out
 // and the activation cache keyed to `key` (the tensor the consuming matmul takes as src1). Only for shapes

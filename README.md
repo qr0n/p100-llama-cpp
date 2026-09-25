@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0009`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0011`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -22,6 +22,8 @@ What you get depends on your setup:
 | your setup | what applies | expect |
 |---|---|---|
 | any P100 (sm_60), quantized model | `0007` + `0008` | fp16 matrix-vector path: **Llama-3.1-8B Q4_K_M tg 39.3 -> 79.6, i.e. 2.03x**; qwen3.8-27b tg 25.0 -> 33.7 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
+| any P100, several sequences at once (`llama-server --parallel N`, concurrent agents) | `0011` (on top of `0007`-`0009`) | batched decode on the fp16 and fused paths: **qwen3.8-27b, 4 concurrent agents 16.0 -> 20.3 tok/s each (58.7 -> 72.9 aggregate)**, one agent unchanged — see [`docs/concurrent-decode.md`](docs/concurrent-decode.md) |
+| any pre-Volta card, long context | `0010`, **by [Kmic-68](https://github.com/Kmic-68/llama.cpp)** | cuBLAS-GEMM flash attention for long prefill plus GQA-6 tile kernels: **qwen3.8-27b pp2048 at 32k depth 285.6 -> 352.9 (+23.6%)**, perplexity unchanged — see [`docs/long-context-attention.md`](docs/long-context-attention.md) |
 | any P100, Qwen3.8 / Qwen3-Next style gated delta-net model | `0009` (on top of `0007`/`0008`) | the recurrent-state plumbing folded into its kernels: **qwen3.8-27b real-use decode 32.3 -> 35.3 tok/s (+9.1%)**, 480 fewer kernel launches per token, output bit-identical — see [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md) |
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
@@ -122,6 +124,23 @@ against a Q8_0 reference unchanged in every digit), and real-use decode goes
 write-up includes the one trap worth knowing before you fuse anything in a ggml
 graph: skipping a node changes what the allocator thinks is still alive — a version
 that ignored that was 1.7% faster and wrong. [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md)
+
+Patch `0010` is **[Kmic-68](https://github.com/Kmic-68)'s work**
+([github.com/Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp)), included
+unchanged with his authorship. It gives Pascal a cuBLAS-GEMM flash attention for
+long prefill, where the tile kernel reaches a fraction of the card's fp16 rate. It
+also adds tile kernels that fold all 6 query heads per KV head that Qwen3.8-27B has
+under `-sm tensor`. Here that is **+23.6% prompt processing at 32k depth** with
+perplexity unchanged. [`docs/long-context-attention.md`](docs/long-context-attention.md)
+
+Patch `0011` is for **concurrent agents**: `llama-server --parallel N` decodes one
+token for each of N sequences per step. Most of `0007`-`0009` declined that shape
+and fell back to stock kernels. `0011` extends the fp16 matmuls, the in-place state
+reads and the fused norm to it, and fixes a Q6_K kernel whose predicated loads
+fetched each activation four times. Four agents on qwen3.8-27b go from **16.0 to
+20.3 tok/s each**. The write-up covers the race that in-place state reads
+cannot have with one sequence but can with several: the recurrent memory reorders
+cells. [`docs/concurrent-decode.md`](docs/concurrent-decode.md)
 
 `0001` and `0002` are 61 added lines across two files: one architecture-neutral,
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and

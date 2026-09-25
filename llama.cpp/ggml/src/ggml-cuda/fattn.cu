@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-gemm.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -516,8 +517,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // The tile kernel dequantizes a q4_0 cache straight into its shared tile, so it no longer
+    // pays launch_fattn's whole-cache f16 conversion. That moved the vec/tile crossover: at
+    // kv=262144 tile does nb=4 in 4176 us where vec needs 4286 us for nb=2. Prefer it wherever
+    // that path exists (GGML_CUDA_FA_TILE_Q4_0=0 to force the old split).
+    const bool tile_q4_0_direct = ggml_cuda_fattn_tile_q4_0_direct(dst);
+
     // If there are no tensor cores available, use the generic tile kernel:
-    if (can_use_vector_kernel) {
+    if (can_use_vector_kernel && !tile_q4_0_direct) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
@@ -542,6 +549,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
+    // The GEMM path dequantizes K/V one chunk at a time out of its own pool scratch, so it
+    // needs none of the whole-cache f16 staging reserved below. That staging is 512 MiB per
+    // GPU at 262144 context (2 of 4 KV heads x 256 dim x 262144 positions x 2 bytes, K and V),
+    // which is ~58k tokens of q4_0 KV cache -- so this early-out is the point of the path as
+    // much as the speed is.
+    if (ggml_cuda_fa_gemm_enabled() && ggml_cuda_flash_attn_ext_gemm_supported(dst) &&
+        ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_VOLTA) {
+        return ggml_nbytes(dst);
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -549,6 +566,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // The tile kernel dequantizes a q4_0 cache into its shared tile, so that case
+            // needs none of the whole-cache f16 staging -- 512 MiB per GPU at 262144.
+            need_f16_K = !ggml_cuda_fattn_tile_q4_0_direct(dst);
+            need_f16_V = need_f16_K;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -569,6 +591,19 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // cuBLAS-GEMM attention for pre-Volta. On Pascal the tile kernel runs at 18.6%
+    // of peak while cuBLAS reaches 13-15 TFLOPS at these same shapes; attention is ~86% of
+    // prefill at 262144 context.
+    // ON by default -- ggml_cuda_fa_gemm_enabled() is `!s || s[0] != '0'`. Set
+    // GGML_CUDA_FA_GEMM=0 to fall back to upstream. (This comment previously said the
+    // opposite, which is how a default-on precision regression went unnoticed.)
+    if (ggml_cuda_fa_gemm_enabled() && ggml_cuda_flash_attn_ext_gemm_supported(dst) &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
+        ggml_cuda_flash_attn_ext_gemm(ctx, dst);
+        return;
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

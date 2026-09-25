@@ -1428,6 +1428,10 @@ struct ggml_backend_cuda_context {
     // only within one graph evaluation (mmvq-gp100.cu)
     uint64_t graph_epoch = 0;
 
+    // GP100: the gated_delta_net node about to run whose recurrent state may be read in place from the cache
+    // (set by the graph evaluation, which can prove nothing overwrites the cache rows first; see ggml-cuda.cu)
+    const ggml_tensor * gp100_gdn_gather = nullptr;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

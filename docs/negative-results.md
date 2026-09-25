@@ -156,3 +156,28 @@ The output head is the one Q6_K shape with short rows under `-sm tensor` (K = 25
 124160 rows), and it ran at ~237 GB/s vs ~466 for the rest of Q6_K. R=8 instead of 4
 measured **-0.2% tg128** (33.61/33.63 vs 33.69/33.69, alternating, cooled) — noise.
 It is carried in `0009` only because it is part of the tree that was tested.
+
+## Loop-carried activation pointers in the multi-column Q4_K/Q5_K kernel (2026-09-25): -4.4%
+
+The 4-column kernel spends a lot of its issue slots on integer address arithmetic,
+so the obvious change was to hoist the per-column pointers out of the loop and
+advance them by four super-blocks per iteration. With 4 concurrent sequences it
+measured **76.2 vs 79.7 tok/s** (alternating, twice). Computing the column offsets
+once in 32-bit instead left the SASS all but unchanged: 65 -> 66 XMAD, so the
+multiplies come from somewhere else. The epilogue half of the same experiment
+(2 FMUL + 4 FFMA per row and column) was +0.6% on its own and is in `0011`. This is
+the same lesson as `0007`'s kernel body: rank variants in situ, because ptxas
+placement decides.
+
+## More rows per warp at 4 columns (2026-09-25): R=4 is the peak
+
+Multi-column MMVQ at 4 sequences, decode tok/s aggregate: R=1 42.8, R=2 62.3,
+**R=4 74.3**, R=8 66.9. At R=8 x 4 columns the accumulators push the kernel to 250+
+registers and it loses occupancy.
+
+## nvprof metrics under `-sm tensor` (2026-09-25): not available
+
+`nvprof --metrics` (as root, since the driver restricts counters) fails with
+`CUDA profiling error` on the two-GPU tensor-split process even with a kernel
+filter. Counting SASS instruction classes per loop iteration was the workable
+substitute. It found the Q6_K redundant loads in `0011`.

@@ -1,0 +1,808 @@
+From 682f37dfa6f4bc132d68bd944d903b527c5b2018 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 02:23:35 +0000
+Subject: [PATCH 11/11] CUDA: GP100: batched decode (several sequences, one
+ token each) on the fp16 and fused state paths
+
+Concurrent agents (llama-server --parallel N) decode one token for each of N
+sequences per step. On GP100 most of the batch-1 work from 0007-0009 declined
+that shape and fell back to stock kernels. This extends it (sm_60 only):
+
+- MMVQ takes [K, 1, n_seqs] activations (qwen35's ssm_out) as n columns;
+  they went to the emulated-int8 kernel at one column per sequence.
+- Q6_K uses its multi-column kernel for 2..4 columns, with its activation
+  reads made unconditional so the compiler shares them across rows
+  (104 -> 60 loads per iteration); Q4_K/Q5_K multi-column epilogue is
+  2 FMUL + 4 FFMA per (row, column).
+- gated_delta_net reads the recurrent states of all sequences in place: one
+  block covers a head's columns in every sequence and barriers between the
+  state loads and stores, so a cell reordered by the recurrent memory (a
+  source row that is another sequence's destination) is still read first.
+  The q/k l2_norm and beta sigmoid fusions follow it.
+- ssm_conv reads/writes the cached windows of every sequence in place (one
+  thread per channel across all sequences, loads before stores).
+- The fused RMS_NORM*weight+activation prep takes up to 8 rows when a matmul
+  reads the result.
+- Flash attention (on top of 0010): 2..4-token batches over a KV cache
+  shorter than 65536 take the 2-head tile ladder instead of the 6-head fold,
+  which is slower there (4 sequences: ~1.5k KV 82.9 vs 86.4 tok/s, 32k 74.3
+  vs 76.0; at 98k the fold wins, 61.9 vs 60.5, and keeps it). One token,
+  MTP-sized batches, prefill and q4_0 caches are unchanged.
+- Every in-place state read now also proves that the recurrent memory's
+  "extra" state copy (llm_graph_context::build_rs), which writes the same
+  cache after the gather, is empty; otherwise the stock gather runs. This
+  also covers the one-sequence paths from 0009.
+
+2x P100, -sm tensor, Qwen3.8-27B UD-Q4_K_XL, llama-batched-bench decode
+(tok/s aggregate): 1 seq 35.2 -> 35.7, 2 seqs 48.6 -> 59.0, 4 seqs 68.0 ->
+86.9, 8 seqs 83.8 -> 98.4. State fusions are bit-identical to the stock
+kernels at 4 sequences; one-sequence output is unchanged in every digit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PGt2W8L2qGgNNjiAXacnWc
+---
+ ggml/src/ggml-cuda/common.cuh          |  4 ++
+ ggml/src/ggml-cuda/fattn-tile.cuh      |  9 ++-
+ ggml/src/ggml-cuda/gated_delta_net.cu  | 79 +++++++++++++++++++----
+ ggml/src/ggml-cuda/gated_delta_net.cuh |  3 +
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 75 +++++++++++++++++-----
+ ggml/src/ggml-cuda/mmvq-gp100.cu       | 89 +++++++++++++++++---------
+ ggml/src/ggml-cuda/mmvq-gp100.cuh      |  3 +-
+ ggml/src/ggml-cuda/ssm-conv.cu         | 85 +++++++++++++++---------
+ ggml/src/ggml-cuda/ssm-conv.cuh        |  3 +-
+ tests/test-backend-ops.cpp             |  3 +
+ 10 files changed, 260 insertions(+), 93 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2b77bfb17..2960e6c7b 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1428,6 +1428,10 @@ struct ggml_backend_cuda_context {
+     // only within one graph evaluation (mmvq-gp100.cu)
+     uint64_t graph_epoch = 0;
+ 
++    // GP100: the gated_delta_net node about to run whose recurrent state may be read in place from the cache
++    // (set by the graph evaluation, which can prove nothing overwrites the cache rows first; see ggml-cuda.cu)
++    const ggml_tensor * gp100_gdn_gather = nullptr;
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index af7ff8297..0db6eb1ad 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1611,7 +1611,14 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+         // ncols2 == 2 and reads the KV cache 3x per forward pass instead of once.
+ #ifndef GGML_USE_HIP
+         if constexpr (DKQ == 256 && DV == 256) {
+-            if (use_gqa_opt && gqa_ratio % 6 == 0) {
++            // Except 2..4-token batches (batched decode: one token for each of several sequences) over a KV
++            // cache shorter than 65536: there the 6-head fold's 24-wide tile is slower than the 2-head ladder.
++            // Measured on 2x P100, qwen3.8-27b, 4 sequences, f16 KV, decode tok/s aggregate, 6-fold vs ladder:
++            // ~1.5k KV 82.9 vs 86.4, 32k KV 74.3 vs 76.0, 98k KV 61.9 vs 60.5. A q4_0 cache keeps the fold
++            // (its direct-dequant loads exist only there).
++            const bool short_batch = Q->ne[1] >= 2 && Q->ne[1] <= 4 && K->ne[1] < 65536 &&
++                                     K->type != GGML_TYPE_Q4_0 && dst->src[2]->type != GGML_TYPE_Q4_0;
++            if (use_gqa_opt && gqa_ratio % 6 == 0 && !short_batch) {
+                 launch_fattn_tile_switch_ncols1<DKQ, DV, 6, use_logit_softcap>(ctx, dst);
+                 return;
+             }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index e8f932beb..8c9be951a 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,7 +1,7 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
+-template <int S_v, bool KDA, bool keep_rs_t, bool gather_t, bool l2_qk_t, bool ab_t>
++template <int S_v, bool KDA, bool keep_rs_t, bool gather_t, bool l2_qk_t, bool ab_t, bool ms_t = false>
+ static __device__ __forceinline__ void gated_delta_net_body(const float * q,
+                                      const float * k,
+                                      const float * v,
+@@ -29,12 +29,14 @@ static __device__ __forceinline__ void gated_delta_net_body(const float * q,
+                                      int           K,
+                                      const int32_t * s_ids,
+                                      int64_t       s_row,
+-                                     float         l2_eps) {
++                                     float         l2_eps,
++                                     int           ms_cols = 0) {
+     const uint32_t h_idx    = blockIdx.x;
+-    const uint32_t sequence = blockIdx.y;
+-    // each warp owns one column, using warp-level primitives to reduce across rows
++    // each warp owns one column, using warp-level primitives to reduce across rows (ms_t: one column of one
++    // sequence, the block spanning ms_cols columns of every sequence)
++    const uint32_t sequence = ms_t ? threadIdx.y / ms_cols : blockIdx.y;
+     const int      lane     = threadIdx.x;
+-    const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
++    const int      col      = ms_t ? blockIdx.z * ms_cols + threadIdx.y % ms_cols : blockIdx.z * blockDim.y + threadIdx.y;
+ 
+     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+@@ -68,6 +70,11 @@ static __device__ __forceinline__ void gated_delta_net_body(const float * q,
+         const int i = r * warp_size + lane;
+         s_shard[r]  = curr_state[i];
+     }
++    if constexpr (ms_t) {
++        __syncthreads(); // every state row of these columns is read before any is written
++    } else {
++        GGML_UNUSED(ms_cols);
++    }
+ 
+     for (int t = 0; t < n_tokens; t++) {
+         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+@@ -233,6 +240,28 @@ __global__ void GDN_LAUNCH_BOUNDS gated_delta_net_gather_cuda(
+ #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+ }
+ 
++// GP100 only, batched decode (n_seqs in 2..GDN_GATHER_MAX_SEQS, one token each, scalar gate): the recurrent state
++// is read in place from cache rows s_ids[seq]. A block covers `cols` state columns of one head in EVERY sequence
++// (one warp per column and sequence), and it barriers after the state loads, so every source row is read before
++// any destination row is written: no other block touches those columns, and a source row that is also another
++// sequence's destination (cells reordered by the recurrent memory) is safe. The body is gated_delta_net_body.
++template <int S_v, bool keep_rs_t, bool l2_qk_t, bool ab_t>
++__global__ void __launch_bounds__(256) gated_delta_net_gather_ms_cuda(
++        const float * q, const float * k, const float * v, const float * g, const float * beta,
++        const float * curr_state, float * dst, float * state, int64_t H, int64_t n_tokens, int64_t n_seqs,
++        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t sb1, int64_t sb2, int64_t sb3, const uint3 neqk1_magic, const uint3 rq3_magic,
++        float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row, float l2_eps, int cols) {
++#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
++    gated_delta_net_body<S_v, false, keep_rs_t, true, l2_qk_t, ab_t, true>(q, k, v, g, beta, curr_state, dst, state, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row, l2_eps, cols);
++#else
++    GGML_UNUSED_VARS(q, k, v, g, beta, curr_state, dst, state, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row, l2_eps, cols);
++    NO_DEVICE_CODE;
++#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
++}
++
+ template <int S_v, bool KDA, bool keep_rs_t>
+ static void launch_gated_delta_net_sv(
+         const ggml_cuda_kernel_launch_params & launch_params,
+@@ -246,6 +275,27 @@ static void launch_gated_delta_net_sv(
+         const uint3 neqk1_magic, const uint3 rq3_magic,
+         float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row, bool l2_qk, float l2_eps,
+         bool ab) {
++    if constexpr (!KDA) {
++        if (s_ids != nullptr && n_seqs > 1) {
++            // one block per (head, column group) for all sequences: see gated_delta_net_gather_ms_cuda
++            const int cols = n_seqs <= 2 ? 4 / (int) n_seqs : 1; // cols * n_seqs warps <= 8
++            ggml_cuda_kernel_launch_params lp = launch_params;
++            lp.block_nums = dim3(H, 1, S_v / cols);
++            lp.block_dims = dim3(launch_params.block_dims.x, cols * n_seqs, 1);
++#define GDN_MS(L2, AB) ggml_cuda_kernel_launch(gated_delta_net_gather_ms_cuda<S_v, keep_rs_t, L2, AB>, lp, \
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row, l2_eps, cols)
++            if (l2_qk && ab) {
++                GDN_MS(true, true);
++            } else if (l2_qk) {
++                GDN_MS(true, false);
++            } else {
++                GDN_MS(false, false);
++            }
++#undef GDN_MS
++            return;
++        }
++    }
+     if (s_ids != nullptr && l2_qk && ab) {
+         ggml_cuda_kernel_launch(gated_delta_net_gather_cuda<S_v, KDA, keep_rs_t, true, true>, launch_params,
+             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+@@ -317,10 +367,14 @@ const ggml_tensor * ggml_cuda_gdn_state_gather(const ggml_tensor * gdn) {
+     }
+     const ggml_tensor * src_v = gdn->src[2];
+     const ggml_tensor * s     = gdn->src[5];
+-    const int64_t S_v = src_v->ne[0], H = src_v->ne[1], n_seqs = src_v->ne[3];
+-    // one sequence: every thread then reads exactly the state elements it later writes, and no other
+-    // block reads them, so the cache row may double as the kernel's input even when it is also the output
+-    if (n_seqs != 1 || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s)) {
++    const int64_t S_v = src_v->ne[0], H = src_v->ne[1], n_tokens = src_v->ne[2], n_seqs = src_v->ne[3];
++    // One sequence: every thread reads exactly the state elements it later writes, and no other block reads
++    // them, so the cache row may double as the kernel's input even when it is also the output.
++    // Several sequences, one token each (batched decode): gated_delta_net_gather_ms_cuda gives each thread its
++    // state elements in EVERY sequence and has it read all source rows before writing any destination row, so
++    // a source row that is another sequence's destination (cells reordered by the recurrent memory) is safe too.
++    const bool multi = n_seqs > 1 && n_seqs <= GDN_GATHER_MAX_SEQS && n_tokens == 1 && gdn->src[3]->ne[0] == 1;
++    if ((n_seqs != 1 && !multi) || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s)) {
+         return nullptr;
+     }
+     const ggml_tensor * rows = s->view_src ? s->view_src : s;
+@@ -330,10 +384,10 @@ const ggml_tensor * ggml_cuda_gdn_state_gather(const ggml_tensor * gdn) {
+     const ggml_tensor * states = rows->src[0];
+     const ggml_tensor * ids    = rows->src[1];
+     if (rows->op != GGML_OP_GET_ROWS || rows->type != GGML_TYPE_F32 || !ggml_is_contiguous(rows) ||
+-        rows->ne[0] != S_v * S_v * H || rows->ne[1] != 1 || rows->ne[2] != 1 || rows->ne[3] != 1 ||
++        rows->ne[0] != S_v * S_v * H || rows->ne[1] != n_seqs || rows->ne[2] != 1 || rows->ne[3] != 1 ||
+         states->type != GGML_TYPE_F32 || states->nb[0] != sizeof(float) || states->ne[0] != rows->ne[0] ||
+         states->nb[1] % sizeof(float) != 0 || states->ne[2] != 1 || states->ne[3] != 1 ||
+-        ids->type != GGML_TYPE_I32 || ids->ne[0] != 1 || states->data == nullptr || ids->data == nullptr) {
++        ids->type != GGML_TYPE_I32 || ids->ne[0] != n_seqs || states->data == nullptr || ids->data == nullptr) {
+         return nullptr;
+     }
+     return rows;
+@@ -349,8 +403,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     ggml_tensor * src_state = dst->src[5];
+ 
+     // GP100: read the recurrent state in place from the cache row (see ggml_cuda_gdn_state_gather)
++    // Only when the graph evaluation has proven that nothing overwrites the cache rows before this node runs.
+     const ggml_tensor * gather = nullptr;
+-    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL) {
++    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL && ctx.gp100_gdn_gather == dst) {
+         gather = ggml_cuda_gdn_state_gather(dst);
+     }
+     const int32_t * s_ids = gather ? (const int32_t *) gather->src[1]->data : nullptr;
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index c9b7172ba..72ad8e954 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -2,6 +2,9 @@
+ #include "ggml.h"
+ 
+ // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
++// GP100 in-place state read: most sequences one batched-decode step may carry
++#define GDN_GATHER_MAX_SEQS 8
++
+ struct ggml_cuda_gated_delta_net_fused_cache {
+     float * data;        // rollback slot 0
+     int64_t slot_stride; // between rollback slots (0 when K==1)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index baa7a91a9..97eee2fbf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3280,6 +3280,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ // GP100: a GET_ROWS that gathers a recurrent state for exactly one gated_delta_net is not computed; that op reads
+ // the cache row in place instead (ggml_cuda_gdn_state_gather). Requires the gather's only use to be that op,
+ // either directly or through one reshape/view whose only use is that op.
++static const ggml_tensor * ggml_cuda_gp100_gdn_gather(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int gdn_idx);
++static int ggml_cuda_gp100_find_node(const ggml_cgraph * cgraph, const ggml_tensor * t, int lo, int hi);
++
+ static bool ggml_cuda_gp100_skip_state_gather(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+     const ggml_tensor * rows = cgraph->nodes[i];
+     if (rows->op != GGML_OP_GET_ROWS || (rows->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+@@ -3299,7 +3302,7 @@ static bool ggml_cuda_gp100_skip_state_gather(const ggml_backend_cuda_context *
+             continue;
+         }
+         if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == user) {
+-            return ggml_cuda_gdn_state_gather(n) == rows;
++            return ggml_cuda_gp100_gdn_gather(cuda_ctx, cgraph, j) == rows;
+         }
+     }
+     return false;
+@@ -3340,6 +3343,22 @@ static bool ggml_cuda_gp100_not_clobbered(const ggml_backend_cuda_context * cuda
+     return true;
+ }
+ 
++// GP100: the GET_ROWS gather feeding gated_delta_net node gdn_idx, when the node may instead read the cache rows in
++// place: ggml_cuda_gdn_state_gather's shape match, plus proof that no node run in between writes the cache. The
++// recurrent memory copies "extra" states into the same cache right after the gather (llm_graph_context::build_rs);
++// when that copy is not empty the stock gather runs.
++static const ggml_tensor * ggml_cuda_gp100_gdn_gather(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int gdn_idx) {
++    const ggml_tensor * rows = ggml_cuda_gdn_state_gather(cgraph->nodes[gdn_idx]);
++    if (rows == nullptr) {
++        return nullptr;
++    }
++    const int rows_idx = ggml_cuda_gp100_find_node(cgraph, rows, gdn_idx - 256, gdn_idx);
++    if (rows_idx < 0 || !ggml_cuda_gp100_not_clobbered(cuda_ctx, cgraph, rows->src[0], rows_idx, gdn_idx)) {
++        return nullptr;
++    }
++    return rows;
++}
++
+ static bool ggml_cuda_fusion_disabled() {
+     static const bool disabled = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+     return disabled;
+@@ -3352,7 +3371,7 @@ static bool ggml_cuda_gp100_gdn_l2_match(const ggml_backend_cuda_context * cuda_
+     const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+     const ggml_tensor * q   = gdn->src[0];
+     const ggml_tensor * k   = gdn->src[1];
+-    if (ggml_cuda_gdn_state_gather(gdn) == nullptr || q == k ||
++    if (ggml_cuda_gp100_gdn_gather(cuda_ctx, cgraph, gdn_idx) == nullptr || q == k ||
+         q->op != GGML_OP_L2_NORM || k->op != GGML_OP_L2_NORM || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+         ((q->flags | k->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+         ggml_get_op_params_f32(q, 0) != ggml_get_op_params_f32(k, 0) || q->ne[0] != gdn->src[2]->ne[0]) {
+@@ -3391,8 +3410,9 @@ static bool ggml_cuda_gp100_gdn_beta_match(const ggml_backend_cuda_context * cud
+     }
+     const ggml_tensor * braw = sig->src[0];
+     const int64_t H = gdn->src[2]->ne[1];
++    const int64_t n = H * gdn->src[2]->ne[3]; // one value per head and sequence
+     if (braw->type != GGML_TYPE_F32 || sig->type != GGML_TYPE_F32 || !ggml_is_contiguous(braw) || !ggml_is_contiguous(sig) ||
+-        ggml_nelements(braw) != H || ggml_nelements(sig) != H || braw->data == nullptr) {
++        ggml_nelements(braw) != n || ggml_nelements(sig) != n || braw->data == nullptr) {
+         return false;
+     }
+     sig_idx = ggml_cuda_gp100_find_node(cgraph, sig, gdn_idx - 128, gdn_idx);
+@@ -3583,7 +3603,7 @@ static bool ggml_cuda_gp100_skip_gdn_l2(const ggml_backend_cuda_context * cuda_c
+ }
+ 
+ // GP100 decode: match  G = GET_ROWS(conv cache, ids) -> reshape -> CC = CONCAT(., transpose(x), 0) -> SSM_CONV,
+-// plus the CPY of CC's last d_conv-1 columns back into the cache. One token and one sequence only. On a match
++// plus the CPY of CC's last d_conv-1 columns back into the cache. One token per sequence, up to 8 sequences. On a match
+ // the conv kernel reads the window in place and writes the shifted one itself, so G, CC and the CPY are not run.
+ // Stateless: the eval loop calls this for the conv and for each of the three nodes it replaces.
+ struct ggml_cuda_gp100_conv_match {
+@@ -3602,19 +3622,21 @@ static bool ggml_cuda_gp100_conv_state_match(const ggml_backend_cuda_context * c
+     const int64_t dc = w->ne[0];
+     if (cc->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cc, 0) != 0 || cc->type != GGML_TYPE_F32 ||
+         !ggml_is_contiguous(cc) || (cc->flags & GGML_TENSOR_FLAG_OUTPUT) || dc < 2 ||
+-        cc->ne[0] != dc || cc->ne[2] != 1 || cc->ne[3] != 1) { // ne[0] == dc  <=>  one token
++        cc->ne[0] != dc || cc->ne[2] < 1 || cc->ne[2] > 8 || cc->ne[3] != 1) { // ne[0] == dc  <=>  one token
+         return false;
+     }
+     const int64_t C = cc->ne[1];
++    const int64_t n_seqs = cc->ne[2];
+     const ggml_tensor * rg = cc->src[0];
+     const ggml_tensor * x  = cc->src[1];
+     const ggml_tensor * g  = rg->view_src ? rg->view_src : rg;
+     if ((rg->view_src && (rg->view_offs != 0 || !ggml_is_contiguous(rg))) || rg->ne[0] != dc - 1 || rg->ne[1] != C ||
+-        g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32 || (g->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+-        !ggml_is_contiguous(g) || g->ne[0] != (dc - 1) * C || g->ne[1] != 1 || g->ne[2] != 1 || g->ne[3] != 1 ||
++        rg->ne[2] != n_seqs || g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32 || (g->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++        !ggml_is_contiguous(g) || g->ne[0] != (dc - 1) * C || g->ne[1] != n_seqs || g->ne[2] != 1 || g->ne[3] != 1 ||
+         g->src[0]->type != GGML_TYPE_F32 || g->src[0]->nb[0] != sizeof(float) || g->src[0]->ne[0] != g->ne[0] ||
+-        g->src[0]->nb[1] % sizeof(float) != 0 || g->src[1]->type != GGML_TYPE_I32 || g->src[1]->ne[0] != 1 ||
+-        x->type != GGML_TYPE_F32 || x->ne[0] != 1 || x->ne[1] != C || x->nb[1] % sizeof(float) != 0 ||
++        g->src[0]->nb[1] % sizeof(float) != 0 || g->src[1]->type != GGML_TYPE_I32 || g->src[1]->ne[0] != n_seqs ||
++        x->type != GGML_TYPE_F32 || x->ne[0] != 1 || x->ne[1] != C || x->ne[2] != n_seqs || x->ne[3] != 1 ||
++        x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 ||
+         g->src[0]->data == nullptr || g->src[1]->data == nullptr || x->data == nullptr) {
+         return false;
+     }
+@@ -3643,9 +3665,10 @@ static bool ggml_cuda_gp100_conv_state_match(const ggml_backend_cuda_context * c
+         const ggml_tensor * v = n->src[0];
+         const ggml_tensor * u = n->src[1];
+         const int v_idx = ggml_cuda_gp100_find_node(cgraph, v, cc_idx + 1, j);
+-        if (v->src[0] != cc || v->view_offs != sizeof(float) || v->ne[0] != dc - 1 || v->ne[1] != C || v->ne[2] != 1 ||
+-            v->nb[0] != sizeof(float) || v->nb[1] != cc->nb[1] || v_idx < 0 || ggml_node_get_use_count(cgraph, v_idx) != 1 ||
+-            u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u) || ggml_nelements(u) != (dc - 1) * C || u->data == nullptr ||
++        if (v->src[0] != cc || v->view_offs != sizeof(float) || v->ne[0] != dc - 1 || v->ne[1] != C || v->ne[2] != n_seqs ||
++            v->nb[0] != sizeof(float) || v->nb[1] != cc->nb[1] || v->nb[2] != cc->nb[2] || v_idx < 0 ||
++            ggml_node_get_use_count(cgraph, v_idx) != 1 || u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u) ||
++            ggml_nelements(u) != (dc - 1) * C * n_seqs || u->data == nullptr ||
+             (n->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j) != 0) {
+             return false;
+         }
+@@ -3657,12 +3680,22 @@ static bool ggml_cuda_gp100_conv_state_match(const ggml_backend_cuda_context * c
+     }
+     // x is read at the conv, after its last graph consumer (CC); the kernel's own output is written per channel,
+     // so it may alias x exactly (in place) but must not overlap it otherwise
++    // (the node the kernel writes: the same choice ggml_cuda_gp100_conv_state makes)
+     const ggml_tensor * out = conv;
+-    if (c + 1 < cgraph->n_nodes && cgraph->nodes[c + 1]->src[0] == conv) {
+-        out = c + 2 < cgraph->n_nodes && cgraph->nodes[c + 2]->src[0] == cgraph->nodes[c + 1] ? cgraph->nodes[c + 2] : cgraph->nodes[c + 1];
++    if (ggml_cuda_can_fuse(cgraph, c, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
++        out = cgraph->nodes[c + 2];
++    } else if (ggml_cuda_can_fuse(cgraph, c, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
++        out = cgraph->nodes[c + 1];
+     }
++    // The cache rows are read at the conv, after G: nothing run in between may write them (the recurrent memory's
++    // "extra" state copy into the same cache follows G; when it is not empty the stock nodes run).
+     if (!ggml_cuda_gp100_not_clobbered(cuda_ctx, cgraph, x, cc_idx, c) ||
+-        (ggml_cuda_gp100_overlap(out, x) && !(out->data == x->data && x->nb[1] == sizeof(float)))) {
++        // (the CPY back into the cache is one of the replaced nodes, so it is excluded from that range)
++        !ggml_cuda_gp100_not_clobbered(cuda_ctx, cgraph, g->src[0], g_idx, std::min(cpy_idx, c)) ||
++        (cpy_idx < c && !ggml_cuda_gp100_not_clobbered(cuda_ctx, cgraph, g->src[0], cpy_idx, c)) ||
++        !ggml_is_contiguous(out) || out->ne[2] != n_seqs ||
++        (ggml_cuda_gp100_overlap(out, x) && !(out->data == x->data && x->nb[1] == sizeof(float) &&
++                                              (n_seqs == 1 || x->nb[2] == C * sizeof(float))))) {
+         return false;
+     }
+ 
+@@ -3674,6 +3707,7 @@ static bool ggml_cuda_gp100_conv_state_match(const ggml_backend_cuda_context * c
+     m.st.state_row = g->src[0]->nb[1] / sizeof(float);
+     m.st.x         = (const float *) x->data;
+     m.st.x_stride  = x->nb[1] / sizeof(float);
++    m.st.x_seq_stride = x->nb[2] / sizeof(float);
+     m.st.state_out = (float *) state_out->data;
+     return true;
+ }
+@@ -4424,7 +4458,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+-        if (!ggml_cuda_gp100_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1])) {
++        bool mm_reads = false; // the normed rows feed a matmul (which then takes its activations from the cache)
++        for (int j = i + 2; j < std::min(cgraph->n_nodes, i + 16) && !mm_reads; ++j) {
++            mm_reads = cgraph->nodes[j]->op == GGML_OP_MUL_MAT && cgraph->nodes[j]->src[1] == cgraph->nodes[i + 1];
++        }
++        if (!ggml_cuda_gp100_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1], mm_reads)) {
+             ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+         }
+         return 1;
+@@ -4619,6 +4657,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (node->op == GGML_OP_GATED_DELTA_NET) {
++                    cuda_ctx->gp100_gdn_gather = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_PASCAL &&
++                        ggml_cuda_gp100_gdn_gather(cuda_ctx, cgraph, i) ? node : nullptr;
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
+diff --git a/ggml/src/ggml-cuda/mmvq-gp100.cu b/ggml/src/ggml-cuda/mmvq-gp100.cu
+index 79d330dc1..e64c5fbe5 100644
+--- a/ggml/src/ggml-cuda/mmvq-gp100.cu
++++ b/ggml/src/ggml-cuda/mmvq-gp100.cu
+@@ -328,7 +328,11 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_kq_nc(
+                 }
+                 const float sl = __half2float(__hadd(__low2half(al), __high2half(al)));
+                 const float sh = __half2float(__hadd(__low2half(ah), __high2half(ah)));
+-                sum[r][c] += fmaf(sc0 * s4.x, sl, sc1 * s4.z * sh) - fmaf(m0, s4.y, m1 * s4.w);
++                float acc = sum[r][c];
++                acc = fmaf(sc0, sl * s4.x, acc);
++                acc = fmaf(sc1, sh * s4.z, acc);
++                acc = fmaf(-m0, s4.y, acc);
++                sum[r][c] = fmaf(-m1, s4.w, acc);
+             }
+         }
+     }
+@@ -719,6 +723,9 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_nc(
+     for (int it = 0; it < nit; it++) {
+         const int  sb   = 4 * it + g;
+         const bool act  = sb < nsb;
++        // activation reads use a clamped super-block so they are unconditional (identical for every row, so the
++        // compiler loads them once per column rather than once per row); act gates only the accumulation
++        const int  sbc  = act ? sb : nsb - 1;
+         const int  nblk = min(nsb - 4 * it, 4);
+ 
+         int m[RT];
+@@ -742,19 +749,18 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_nc(
+         }
+         __syncwarp();
+ 
+-        const uint4 zero4 = make_uint4(0, 0, 0, 0);
+         // per-column scales and -32 offsets do not depend on the row: load them once per iteration
+         float rsc[NC][4], soc[NC][4];
+ #pragma unroll
+         for (int c = 0; c < NC; c++) {
+             const float2 * ysc = ys + (int64_t) c * (K / 32);
+-            const float4 rs01 = act ? __ldg((const float4 *) (ysc + sb * 8 + 4 * n))     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+-            const float4 rs23 = act ? __ldg((const float4 *) (ysc + sb * 8 + 4 * n + 2)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            const float4 rs01 = __ldg((const float4 *) (ysc + sbc * 8 + 4 * n));
++            const float4 rs23 = __ldg((const float4 *) (ysc + sbc * 8 + 4 * n + 2));
+             rsc[c][0] = rs01.x; rsc[c][1] = rs01.z; rsc[c][2] = rs23.x; rsc[c][3] = rs23.z;
+-            const float * sp = s16 + (int64_t) c * (K / 16) + sb * 16 + 8 * n + i0;
++            const float * sp = s16 + (int64_t) c * (K / 16) + sbc * 16 + 8 * n + i0;
+ #pragma unroll
+             for (int mm = 0; mm < 4; mm++) {
+-                soc[c][mm] = act ? __ldg(sp + 2 * mm) * offm : 0.0f;
++                soc[c][mm] = __ldg(sp + 2 * mm) * offm;
+             }
+         }
+ #pragma unroll
+@@ -794,8 +800,8 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_nc(
+             const float dd = __half2float(__ushort_as_half((unsigned short) (DW & 0xFFFF)));
+ #pragma unroll
+             for (int c = 0; c < NC; c++) {
+-                const uint4 * yp = (const uint4 *) (y + (int64_t) c * K + sb * 256 + 128 * n + 8 * c4);
+-                const uint4 yv[4] = {act ? __ldg(yp) : zero4, act ? __ldg(yp + 4) : zero4, act ? __ldg(yp + 8) : zero4, act ? __ldg(yp + 12) : zero4};
++                const uint4 * yp = (const uint4 *) (y + (int64_t) c * K + sbc * 256 + 128 * n + 8 * c4);
++                const uint4 yv[4] = {__ldg(yp), __ldg(yp + 4), __ldg(yp + 8), __ldg(yp + 12)};
+                 float sacc = 0.0f;
+ #pragma unroll
+                 for (int mm = 0; mm < 4; mm++) {
+@@ -1096,6 +1102,14 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
+ #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+ }
+ 
++// Columns of a matmul operand: its rows, or its ne[2] when it is [K, 1, n] (one token per sequence), else 0.
++static int64_t gp100_ncols(const ggml_tensor * t) {
++    return t->ne[2] == 1 ? t->ne[1] : (t->ne[1] == 1 ? t->ne[2] : 0);
++}
++static int64_t gp100_col_stride(const ggml_tensor * t) {
++    return (t->ne[2] == 1 ? t->nb[1] : t->nb[2]) / sizeof(float);
++}
++
+ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                                     const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+     if (cc != GGML_CUDA_CC_PASCAL || GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_MTHREADS(cc)) {
+@@ -1124,16 +1138,18 @@ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, cons
+         default:
+             return false;
+     }
+-    // 1 column (all types above), or 2..8 columns (Q4_K/Q5_K/IQ4_XS, no fusion): plain 2D, contiguous rows
+-    const int64_t ncols = src1->ne[1];
+-    if (ncols < 1 || ncols > 8 || dst->ne[1] != ncols ||
++    // 1 column (all types above), or 2..8 columns (Q4_K/Q5_K/IQ4_XS, no fusion). The columns are either src1's
++    // rows (ne[1]) or, for one-token-per-sequence batches shaped [K, 1, n_seqs] (qwen35's ssm_out), its ne[2].
++    const int64_t ncols = gp100_ncols(src1);
++    if (ncols < 1 || ncols > 8 || gp100_ncols(dst) != ncols || src1->ne[1] != dst->ne[1] ||
+         (ncols > 1 && (fusion || (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
+-                                  src0->type != GGML_TYPE_IQ4_XS)))) {
+-        // Q6_K has a multi-column kernel (gp100_mmvq_q6_K_nc) but it loses to the generic int8 path at 5 columns
+-        // in situ (7.68 vs 6.18 ms per verify batch), so Q6_K batches stay generic
++                                  src0->type != GGML_TYPE_IQ4_XS && !(src0->type == GGML_TYPE_Q6_K && ncols <= 4))))) {
++        // Q6_K's multi-column kernel (gp100_mmvq_q6_K_nc) loses to the generic int8 path at 5 columns in situ
++        // (7.68 vs 6.18 ms per MTP verify batch) but wins at 4 concurrent sequences (batched decode 73.1 -> 74.2
++        // tok/s aggregate), so it takes 2..4 columns only
+         return false;
+     }
+-    return src1->ne[2] == 1 && src1->ne[3] == 1 && dst->nb[0] == sizeof(float) &&
++    return src1->ne[3] == 1 && dst->nb[0] == sizeof(float) &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
+            src0->ne[0] % QK_K == 0 && src0->nb[1] % 2 == 0 && (uintptr_t) src0->data % 16 == 0 &&
+            (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->nb[1] % 16 == 0); // Q6_K/Q3_K are staged
+@@ -1261,15 +1277,15 @@ static void gp100_dispatch(const ggml_type type, const void * W, const void * G,
+     }
+ }
+ 
+-// 2..8 columns. R x NC accumulators per thread: R = 4 up to 2 columns, 2 up to 4, then 1.
++// 2..8 columns: 4 rows per warp, R x NC accumulators per thread. In situ at 4 columns (batched decode, tok/s
++// aggregate): R=1 42.8, R=2 62.3, R=4 74.3, R=8 66.9.
+ template <ggml_type type, int NC>
+ static void gp100_launch_nc(const void * W, const half * y, const float2 * ys, const float * s16, float * dst, const int nrows, const int nsb,
+                             const int stride_row, const int stride_dst, cudaStream_t stream) {
+     constexpr int R = 4;
+     const int nblocks = (nrows + 4*R - 1) / (4*R);
+     if constexpr (type == GGML_TYPE_Q6_K) {
+-        constexpr int R6 = 4;
+-        gp100_mmvq_q6_K_nc<R6, NC><<<(nrows + 4*R6 - 1) / (4*R6), 128, 0, stream>>>(W, y, ys, s16, dst, nrows, nsb, stride_row, stride_dst);
++        gp100_mmvq_q6_K_nc<R, NC><<<nblocks, 128, 0, stream>>>(W, y, ys, s16, dst, nrows, nsb, stride_row, stride_dst);
+     } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+         gp100_mmvq_iq4_xs_nc<R, NC><<<nblocks, 128, 0, stream>>>(W, y, ys, dst, nrows, nsb, stride_row, stride_dst);
+     } else {
+@@ -1339,7 +1355,7 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+     cudaStream_t stream = ctx.stream();
+     const int64_t K     = src0->ne[0];
+     const int64_t nrows = src0->ne[1];
+-    const int     ncols = src1->ne[1];
++    const int     ncols = gp100_ncols(src1);
+     const int     nb32  = K / 32;
+ 
+     ggml_cuda_pool_alloc<char> tmp(ctx.pool());
+@@ -1358,13 +1374,13 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+     float  * s16 = (float  *) (base + GP100_OFF_S16);
+     if (!hit) {
+         const int nblk = nb32 * ncols;
+-        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, src1->nb[1] / sizeof(float));
++        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, gp100_col_stride(src1));
+     }
+ 
+     const int nsb        = K / QK_K;
+     const int stride_row = src0->nb[1] / ggml_type_size(src0->type);
+     if (ncols > 1) {
+-        gp100_dispatch_nc(src0->type, src0->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, ncols, dst->nb[1] / sizeof(float), stream);
++        gp100_dispatch_nc(src0->type, src0->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, ncols, gp100_col_stride(dst), stream);
+     } else if (fusion) {
+         gp100_dispatch<true >(src0->type, src0->data, fusion->gate->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, stream);
+     } else {
+@@ -1379,9 +1395,15 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+ // the following matmuls skip their own conversion.
+ static __global__ void gp100_rms_norm_mul_prep(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ out,
+                                                half * __restrict__ y, float2 * __restrict__ ys, float * __restrict__ s16,
+-                                               const int K, const float eps) {
++                                               const int K, const float eps, const int64_t x_stride) {
+ #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+     __shared__ float red[4];
++    // row blockIdx.y (one per sequence in a batched decode): its own input row, output column and cache column
++    x   += blockIdx.y * x_stride;
++    out += blockIdx.y * K;
++    y   += blockIdx.y * K;
++    ys  += blockIdx.y * (K / 32);
++    s16 += blockIdx.y * (K / 16);
+     const float4 * x4 = (const float4 *) x;
+     float ss = 0.0f;
+     for (int i = threadIdx.x; i < K / 4; i += blockDim.x) {
+@@ -1429,12 +1451,12 @@ static __global__ void gp100_rms_norm_mul_prep(const float * __restrict__ x, con
+         ys[b] = make_float2(ldexpf(1.0f, 24 - k), s);
+     }
+ #else
+-    GGML_UNUSED_VARS(x, w, out, y, ys, s16, K, eps);
++    GGML_UNUSED_VARS(x, w, out, y, ys, s16, K, eps, x_stride);
+     NO_DEVICE_CODE;
+ #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+ }
+ 
+-bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul) {
++bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, const bool multi_row) {
+     static const bool disabled = getenv("GGML_CUDA_GP100_NO_NORM_FUSION") != nullptr;
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     if (disabled || cc != GGML_CUDA_CC_PASCAL || !gp100_cache_enabled()) {
+@@ -1443,11 +1465,14 @@ bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const ggml_tensor * x = rms_norm->src[0];
+     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+     const int64_t K = x->ne[0];
+-    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+-        ggml_nrows(x) != 1 || ggml_nrows(w) != 1 || w->ne[0] != K || ggml_nrows(mul) != 1 || mul->ne[0] != K ||
+-        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) || !ggml_is_contiguous(mul) ||
+-        K % QK_K != 0 || K > GP100_ACT_CACHE_MAX_K ||
+-        (uintptr_t) x->data % 16 != 0) {
++    // one row, or (multi_row: the caller found a matmul reading the result) one row per sequence of a batched
++    // decode, up to the 8 columns the matmuls take
++    const int64_t nrows = ggml_nrows(x);
++    if ((nrows > 1 && !multi_row) || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++        nrows < 1 || nrows > 8 || ggml_nrows(w) != 1 || w->ne[0] != K || ggml_nrows(mul) != nrows || mul->ne[0] != K ||
++        !ggml_is_contiguous_rows(x) || x->ne[3] != 1 || gp100_ncols(x) != nrows || !ggml_is_contiguous(w) || !ggml_is_contiguous(mul) ||
++        gp100_ncols(mul) != nrows || K % QK_K != 0 || K * nrows > GP100_ACT_CACHE_MAX_K ||
++        (uintptr_t) x->data % 16 != 0 || gp100_col_stride(x) % 4 != 0) {
+         return false;
+     }
+     float eps;
+@@ -1455,9 +1480,9 @@ bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     gp100_act_cache & c = gp100_cache(ctx);
+     const int nb32 = K / 32;
+-    gp100_rms_norm_mul_prep<<<(nb32 + 3) / 4, 128, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul->data,
+-        (half *) c.buf, (float2 *) (c.buf + GP100_OFF_YS), (float *) (c.buf + GP100_OFF_S16), K, eps);
+-    c.src1 = mul; c.data = mul->data; c.K = K; c.ncols = 1; c.epoch = ctx.graph_epoch;
++    gp100_rms_norm_mul_prep<<<dim3((nb32 + 3) / 4, nrows), 128, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul->data,
++        (half *) c.buf, (float2 *) (c.buf + GP100_OFF_YS), (float *) (c.buf + GP100_OFF_S16), K, eps, gp100_col_stride(x));
++    c.src1 = mul; c.data = mul->data; c.K = K; c.ncols = nrows; c.epoch = ctx.graph_epoch;
+     return true;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq-gp100.cuh b/ggml/src/ggml-cuda/mmvq-gp100.cuh
+index 034e37f13..2f7e687ad 100644
+--- a/ggml/src/ggml-cuda/mmvq-gp100.cuh
++++ b/ggml/src/ggml-cuda/mmvq-gp100.cuh
+@@ -12,7 +12,8 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+ 
+ // Fused RMS_NORM * weight for a single row that also fills the GP100 activation cache for the matmuls that
+ // consume it. Returns false (nothing launched) when not applicable.
+-bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul);
++// multi_row: several rows (a batched decode's sequences) are allowed; the caller sets it only when a matmul reads mul
++bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, bool multi_row);
+ 
+ // Gated per-head RMS norm, out = silu(z) * (rms_norm(x) * w) over rows of D = x->ne[0] (64/128/256), writing out
+ // and the activation cache keyed to `key` (the tensor the consuming matmul takes as src1). Only for shapes
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 8b5d00e22..3f0046206 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -205,43 +205,56 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+     }
+ }
+ 
+-// GP100, decode (one token, one sequence): conv_x = concat(get_rows(conv cache), x) is never materialised.
+-// Each thread owns one channel: it reads that channel's d_conv-1 cached values from row ids[0] and the new
+-// input, convolves exactly as ssm_conv_f32 does (same order, so bit-identical), then writes the shifted
+-// window -- what the graph's state cpy would have written -- to state_out. A thread reads all of its
+-// channel's cache values before writing any and no other thread touches them, so state_out may alias the
+-// source row.
+-template <bool apply_silu, size_t split_d_inner, size_t d_conv>
++// GP100, decode (one token per sequence, up to SSM_CONV_STATE_MAX_SEQS sequences): conv_x = concat(get_rows(conv
++// cache), x) is never materialised. Each thread owns one channel in every sequence: it reads that channel's d_conv-1
++// cached values from rows ids[s] and the new inputs, convolves exactly as ssm_conv_f32 does (same order, so
++// bit-identical), then writes the shifted windows -- what the graph's state cpy would have written -- to state_out.
++// A thread reads all of its channel's cache values, in every sequence, before writing any, and no other thread
++// touches them, so state_out may alias the source rows (including another sequence's row after the recurrent
++// memory reorders cells).
++#define SSM_CONV_STATE_MAX_SEQS 8
++template <bool apply_silu, size_t split_d_inner, size_t d_conv, int NS>
+ static __global__ void ssm_conv_state_f32(const float * state, const int32_t * ids, const int64_t state_row,
+-                                          const float * x_new, const int64_t x_stride,
++                                          const float * x_new, const int64_t x_stride, const int64_t x_seq_stride,
+                                           const float * w, const int64_t w_stride, const float * bias,
+-                                          float * dst, float * state_out) {
++                                          float * dst, float * state_out, const int n_seqs, const int64_t C) {
+ #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
++    // NS: most sequences this instance handles (1 keeps the one-sequence kernel as lean as before)
+     const int64_t c  = (int64_t) blockIdx.y * split_d_inner + threadIdx.x;
+-    const float * st = state + (int64_t) ids[0] * state_row + c * (d_conv - 1);
+ 
+-    float x[d_conv];
++    float x[NS][d_conv];
++#pragma unroll
++    for (int s = 0; s < NS; s++) {
++        if (s < n_seqs) {
++            const float * st = state + (int64_t) ids[s] * state_row + c * (d_conv - 1);
+ #pragma unroll
+-    for (size_t j = 0; j < d_conv - 1; j++) {
+-        x[j] = st[j];
++            for (size_t j = 0; j < d_conv - 1; j++) {
++                x[s][j] = st[j];
++            }
++            x[s][d_conv - 1] = x_new[c * x_stride + s * x_seq_stride];
++        }
+     }
+-    x[d_conv - 1] = x_new[c * x_stride];
+ 
+-    float sumf = 0.0f;
+ #pragma unroll
+-    for (size_t j = 0; j < d_conv; j++) {
+-        sumf += x[j] * w[c * w_stride + j];
+-    }
+-    sumf += bias != nullptr ? bias[c] : 0.0f;
+-    dst[c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
++    for (int s = 0; s < NS; s++) {
++        if (s < n_seqs) {
++            float sumf = 0.0f;
++#pragma unroll
++            for (size_t j = 0; j < d_conv; j++) {
++                sumf += x[s][j] * w[c * w_stride + j];
++            }
++            sumf += bias != nullptr ? bias[c] : 0.0f;
++            dst[s * C + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+ 
+-    float * so = state_out + c * (d_conv - 1);
++            float * so = state_out + (s * C + c) * (d_conv - 1);
+ #pragma unroll
+-    for (size_t j = 0; j < d_conv - 1; j++) {
+-        so[j] = x[j + 1];
++            for (size_t j = 0; j < d_conv - 1; j++) {
++                so[j] = x[s][j + 1];
++            }
++        }
+     }
+ #else
+-    GGML_UNUSED_VARS(state, ids, state_row, x_new, x_stride, w, w_stride, bias, dst, state_out);
++    GGML_UNUSED_VARS(state, ids, state_row, x_new, x_stride, x_seq_stride, w, w_stride, bias, dst, state_out, n_seqs, C);
+     NO_DEVICE_CODE;
+ #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+ }
+@@ -255,21 +268,33 @@ void ggml_cuda_op_ssm_conv_gp100_state(ggml_backend_cuda_context & ctx, ggml_ten
+     const int64_t nc = w->ne[0];
+     const int64_t nr = out->ne[0];
+     const int threads = 128;
+-    GGML_ASSERT(nr % threads == 0 && w->nb[0] == sizeof(float) && out->type == GGML_TYPE_F32);
++    const int n_seqs = (int) out->ne[2];
++    GGML_ASSERT(nr % threads == 0 && w->nb[0] == sizeof(float) && out->type == GGML_TYPE_F32 && ggml_is_contiguous(out));
++    GGML_ASSERT(out->ne[1] == 1 && out->ne[3] == 1 && n_seqs >= 1 && n_seqs <= SSM_CONV_STATE_MAX_SEQS);
+     GGML_ASSERT(bias == nullptr || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_nelements(bias) == nr));
+ 
+     const dim3 blocks(1, nr / threads, 1);
+     const float * bias_d = bias ? (const float *) bias->data : nullptr;
+     cudaStream_t stream = ctx.stream();
+ 
+-    auto launch = [&](auto NC) {
++    auto launch_ns = [&](auto NC, auto NS) {
+         constexpr int kNC = decltype(NC)::value;
++        constexpr int kNS = decltype(NS)::value;
+         if (silu_dst) {
+-            ssm_conv_state_f32<true, threads, kNC><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride,
+-                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out);
++            ssm_conv_state_f32<true, threads, kNC, kNS><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride, st.x_seq_stride,
++                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out, n_seqs, nr);
++        } else {
++            ssm_conv_state_f32<false, threads, kNC, kNS><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride, st.x_seq_stride,
++                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out, n_seqs, nr);
++        }
++    };
++    auto launch = [&](auto NC) {
++        if (n_seqs == 1) {
++            launch_ns(NC, std::integral_constant<int, 1>{});
++        } else if (n_seqs <= 4) {
++            launch_ns(NC, std::integral_constant<int, 4>{});
+         } else {
+-            ssm_conv_state_f32<false, threads, kNC><<<blocks, threads, 0, stream>>>(st.state, st.ids, st.state_row, st.x, st.x_stride,
+-                (const float *) w->data, w->nb[1] / sizeof(float), bias_d, (float *) out->data, st.state_out);
++            launch_ns(NC, std::integral_constant<int, SSM_CONV_STATE_MAX_SEQS>{});
+         }
+     };
+     switch (nc) {
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 7fc654a6f..89bd3df08 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -6,10 +6,11 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+ // (the GET_ROWS / CONCAT / CPY around it are skipped; see ggml_cuda_gp100_conv_state_match)
+ struct ggml_cuda_ssm_conv_state {
+     const float *   state;     // conv cache base
+-    const int32_t * ids;       // device row index of the source window
++    const int32_t * ids;       // device row index of each sequence's source window
+     int64_t         state_row; // cache row stride, floats
+     const float *   x;         // new input, channel c at x[c * x_stride]
+     int64_t         x_stride;
++    int64_t         x_seq_stride; // between sequences, floats
+     float *         state_out; // destination row of the shifted window
+ };
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 20ee2a614..a94258cbe 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9175,6 +9175,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         for (int64_t ncols = 2; ncols <= 8; ncols++) { // speculative-decoding verification batches
+             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, ncols, 1280, {1, 1}, {1, 1}));
+         }
++        for (int nseq : {2, 4, 8}) { // one token per sequence, activations shaped [K, 1, n_seqs] (qwen35 ssm_out)
++            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, 1, 1280, {1, 1}, {nseq, 1}));
++        }
+     }
+ 
+ 
+-- 
+2.53.0
+

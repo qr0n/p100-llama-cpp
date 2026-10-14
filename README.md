@@ -45,9 +45,11 @@ for a real 3+ card box is a user report
 X99, Windows): dense Qwen3.8-27B Q8_0 at 262k context goes from ~13 tok/s stock to
 **22-25 tok/s** with `-sm tensor`. `GGML_CUDA_ALLREDUCE=none` costs **25%** there
 and `GGML_CUDA_P2P=1` costs **40%**, so leave both unset. A3B MoE prefers
-`-sm layer` (50-51 vs 20-22 tok/s). The same report found MTP slower on Q8_0 and
-Q6_K weights: the multi-column fp16 kernels that make MTP verification cheap here
-cover Q4_K/Q5_K/IQ4_XS/Q6_K, not Q8_0. `-sm layer` never uses the AllReduce and
+`-sm layer` (50-51 vs 20-22 tok/s). The same report found MTP slower in every
+case it tried. For 27B Q8_0 the cause is known: the multi-column fp16 kernels
+that make MTP verification cheap here cover Q4_K/Q5_K/IQ4_XS/Q6_K, not Q8_0. The
+A3B MoE (Q6_K, so covered) is unexplained; at ~50 tok/s its plain decode is
+probably too cheap for drafting to pay. `-sm layer` never uses the AllReduce and
 works on any number of cards.
 
 **Open: NaN on 4 cards past position 4096**

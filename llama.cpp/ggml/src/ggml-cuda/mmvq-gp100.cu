@@ -1234,11 +1234,14 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void * 
             }
             GGML_ABORT("IQ4_NL supports at most 4 rows per warp");
         case GGML_TYPE_Q6_K:
-            if constexpr (R <= 8) {
+            // Must match the clamp in gp100_dispatch: only the non-GLU output head takes 8 rows. With GLU
+            // the staging doubles, and <8, true> would need 4 x 16 x 896 = 57344 B of static shared memory,
+            // over sm_60's 48 KB. CUDA 12.4's ptxas emits it anyway (it is never launched); 12.8 rejects it.
+            if constexpr (R <= (GLU ? 2 : 8)) {
                 GP100_LAUNCH((gp100_mmvq_q6_K<R, GLU>));
                 break;
             }
-            GGML_ABORT("Q6_K supports at most 8 rows per warp");
+            GGML_ABORT("Q6_K supports at most 8 rows per warp, 2 with GLU");
         default: GGML_ABORT("unsupported type for the GP100 MMVQ path");
     }
 #undef GP100_LAUNCH

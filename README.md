@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0012`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0014`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -28,7 +28,7 @@ What you get depends on your setup:
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
 | two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
-| three or more P100s with `-sm tensor` | all of the above + `0006` | **untested for speed** — see "Three or more cards" below |
+| three or more P100s with `-sm tensor` | all of the above + `0006` | one user report (4 cards): dense 27B **+70-90% tg over stock**; see "Three or more cards" below, including an open bug |
 | P40 / GTX 10xx (sm_61) | `0001`, `0005` | small; `0002` is GP100-only by design. `./build.sh` detects the card; pass `CUDA_ARCH="60;61"` for a binary that serves both |
 
 **Three or more cards.** Upstream llama.cpp's internal AllReduce
@@ -39,10 +39,27 @@ it to N devices. It is **correctness-tested only**: on 2x P100 split into 3 and 
 virtual devices with `GGML_CUDA_DEVICES`, perplexity matches the stock fallback
 (identical at 4, within 0.02% at 3) and is identical across the chunked,
 copy-engine and mixed paths; two-card output is bit-identical to `0005` and tg is
-unchanged. Virtual devices share a GPU and a PCIe link, so there is **no speed
-data for a real 3+ card box** — if you have one, compare `-sm tensor` with and
-without `GGML_CUDA_ALLREDUCE=none` and please report back. `-sm layer` never uses
-the AllReduce and works on any number of cards.
+unchanged. Virtual devices share a GPU and a PCIe link, so the only speed data
+for a real 3+ card box is a user report
+([#2](https://github.com/qr0n/p100-llama-cpp/issues/2), 4x P100 on dual-socket
+X99, Windows): dense Qwen3.8-27B Q8_0 at 262k context goes from ~13 tok/s stock to
+**22-25 tok/s** with `-sm tensor`. `GGML_CUDA_ALLREDUCE=none` costs **25%** there
+and `GGML_CUDA_P2P=1` costs **40%**, so leave both unset. A3B MoE prefers
+`-sm layer` (50-51 vs 20-22 tok/s). The same report found MTP slower on Q8_0 and
+Q6_K weights: the multi-column fp16 kernels that make MTP verification cheap here
+cover Q4_K/Q5_K/IQ4_XS/Q6_K, not Q8_0. `-sm layer` never uses the AllReduce and
+works on any number of cards.
+
+**Open: NaN on 4 cards past position 4096**
+([#4](https://github.com/qr0n/p100-llama-cpp/issues/4)). On that same 4-card box,
+`-sm tensor -ub 1024` produces NaN logits once a prompt has a ubatch starting at
+position >= 4096. It does **not** reproduce on 2x P100 split into 4 virtual
+devices (Q4_K_XL and Q8_0, up to 8.2k tokens, 131k context). `0014` stops one NaN
+from poisoning the slot until a restart; the source of the first NaN is still
+unknown. If you hit it, these narrow it down, one at a time:
+`GGML_CUDA_FA_GEMM=0` (patch `0010`'s GEMM attention off),
+`GGML_CUDA_FA_GEMM_PREC=32` (that path in fp32), `GGML_CUDA_ALLREDUCE=none`
+(patch `0006` off), and `-ub 512` (does the boundary move to 2048?).
 
 **Do not set `GGML_CUDA_P2P`** — on a dual-socket P100 box it is a 10.7x
 regression (see below). Numbers everywhere in this README were measured on one
@@ -148,6 +165,17 @@ sm_61 P40 and triggers a launch assertion. Other architectures now use the
 existing power-of-two ladder, which handles a GQA ratio of six through its
 two-head kernel. The Q4_0 direct-tile and staging checks use the same GP100 gate
 so dispatch and allocation stay consistent.
+
+Patch `0013` fixes the build on CUDA 12.8. It stops `0007` from instantiating an
+8-row GLU Q6_K kernel that is never launched and needs 56 KB of static shared memory.
+CUDA 12.4's ptxas emits that kernel anyway; 12.8's rejects it
+([#3](https://github.com/qr0n/p100-llama-cpp/issues/3), fix by key-sh).
+
+Patch `0014` is an upstream bug, on any card. Recurrent state (the gated delta-net
+layers of Qwen3.8, Mamba, RWKV) was cleared for a new sequence by scaling it by 0,
+and `0 * NaN` is NaN. So one non-finite state left that `llama-server` slot
+returning garbage for every later request until a restart. It is now cleared
+with a fill.
 
 `0001` and `0002` are 61 added lines across two files: one architecture-neutral,
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and

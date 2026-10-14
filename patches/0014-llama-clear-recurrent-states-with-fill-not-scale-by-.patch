@@ -1,0 +1,48 @@
+From 83b076892e24286f34f84a3cc2774315303818b7 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 15:11:50 +0000
+Subject: [PATCH 14/14] llama: clear recurrent states with fill, not scale by 0
+
+build_rs zeroes the state cell that new sequences are copied from with
+ggml_scale_inplace(state, 0). 0 * NaN is NaN, so once a state cell has gone
+non-finite it can never be cleared: every later sequence that is assigned
+that cell starts from NaN and produces NaN logits from its first token, and
+only a process restart recovers. In llama-server that is one slot, since each
+slot keeps its own cell.
+
+Use ggml_fill_inplace(state, 0.0f) instead. Identical for finite states (up
+to the sign of zero); a non-finite one now costs one bad response rather than
+the slot.
+
+Measured on 2x P100, -sm tensor, qwen3.8-27b, with a test-only hook that NaNs
+the recurrent state for ubatches starting at position >= 4096: a 4648-token
+prompt then a fresh 5-token prompt on the same slot. Before: the fresh prompt
+returns garbage with all logprobs null, the shape reported in
+qr0n/p100-llama-cpp#4. After: it returns " Paris." with normal logprobs.
+
+This fixes the "slot stays poisoned until restart" half of #4, reported by
+key-sh. It does not find what produced the first NaN on their 4-GPU box,
+which does not reproduce here.
+---
+ src/llama-graph.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8fca8e1..564d119 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3427,8 +3427,10 @@ ggml_tensor * llm_graph_context::build_rs(
+ 
+     // Clear a single state which will then be copied to the other cleared states.
+     // Note that this is a no-op when the view is zero-sized.
++    // Fill, not scale by 0: 0 * NaN is NaN, so a state cell that ever went non-finite could never be
++    // cleared again, and every later sequence that reused the cell produced NaN from its first token.
+     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
++    ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
+ 
+     // copy states
+     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
+-- 
+2.53.0
+

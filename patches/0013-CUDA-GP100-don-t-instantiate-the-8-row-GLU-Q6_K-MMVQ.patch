@@ -1,0 +1,44 @@
+From a566f6747ef3dc423542d63ac0b1b15a33d1632f Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 15:02:12 +0000
+Subject: [PATCH 13/14] CUDA: GP100: don't instantiate the 8-row GLU Q6_K MMVQ
+ kernel
+
+gp100_dispatch clamps Q6_K to 2 rows per warp when GLU is set (8 only for the
+non-GLU output head), but the compile-time guard in gp100_dispatch_r only
+checked R <= 8, so gp100_mmvq_q6_K<8, true> was still instantiated. Its
+staging is 4 warps x 16 rows x 896 B = 57344 B of static shared memory, over
+sm_60's 48 KB. CUDA 12.4's ptxas emits it anyway (it is never launched);
+CUDA 12.8's rejects it and the build fails.
+
+Make the guard match the runtime clamp. No launched kernel changes.
+
+Reported, with this fix, by key-sh in qr0n/p100-llama-cpp#3.
+---
+ ggml/src/ggml-cuda/mmvq-gp100.cu | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-gp100.cu b/ggml/src/ggml-cuda/mmvq-gp100.cu
+index e64c5fb..de13980 100644
+--- a/ggml/src/ggml-cuda/mmvq-gp100.cu
++++ b/ggml/src/ggml-cuda/mmvq-gp100.cu
+@@ -1234,11 +1234,14 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void *
+             }
+             GGML_ABORT("IQ4_NL supports at most 4 rows per warp");
+         case GGML_TYPE_Q6_K:
+-            if constexpr (R <= 8) {
++            // Must match the clamp in gp100_dispatch: only the non-GLU output head takes 8 rows. With GLU
++            // the staging doubles, and <8, true> would need 4 x 16 x 896 = 57344 B of static shared memory,
++            // over sm_60's 48 KB. CUDA 12.4's ptxas emits it anyway (it is never launched); 12.8 rejects it.
++            if constexpr (R <= (GLU ? 2 : 8)) {
+                 GP100_LAUNCH((gp100_mmvq_q6_K<R, GLU>));
+                 break;
+             }
+-            GGML_ABORT("Q6_K supports at most 8 rows per warp");
++            GGML_ABORT("Q6_K supports at most 8 rows per warp, 2 with GLU");
+         default: GGML_ABORT("unsupported type for the GP100 MMVQ path");
+     }
+ #undef GP100_LAUNCH
+-- 
+2.53.0
+

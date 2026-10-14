@@ -25,7 +25,12 @@ does three things:
 ## Measured here
 
 2x P100, `-sm tensor`, Qwen3.8-27B UD-Q4_K_XL, **f16 KV** (this box's production
-setting; the q4_0-cache parts of the patch are not exercised by these numbers):
+setting; the q4_0-cache parts of the patch are not exercised by these numbers).
+These are the **fp16** GEMM path on cuBLAS 12.4. Since patch `0015`, any other
+cuBLAS version runs that path in fp32, because fp16 produced NaN on cuBLAS 12.8
+([#4](https://github.com/qr0n/p100-llama-cpp/issues/4)). In fp32, pp2048 at depth
+32768 is 295 tok/s instead of 355, i.e. +3.4% over the 285.6 baseline instead of
++23.6%. `GGML_CUDA_FA_GEMM_PREC=16` forces fp16 on a cuBLAS you have checked.
 
 | test | before (`0001`-`0009`) | with `0010` | |
 |---|---|---|---|

@@ -36,23 +36,46 @@
 
 // Precision, chosen at runtime.
 //
-//   default -- COMPUTE_16F for both GEMMs: fp16 scores and probabilities, and an fp16 PV partial
-//     per chunk folded into an fp32 running output. The QK^T dot product (k = D = 256)
+//   GGML_CUDA_FA_GEMM_PREC=16 -- COMPUTE_16F for both GEMMs: fp16 scores and probabilities, and an
+//     fp16 PV partial per chunk folded into an fp32 running output. The QK^T dot product (k = D = 256)
 //     accumulates in fp16, where upstream's tile kernel accumulates KQ in fp32
 //     (fattn-tile.cuh:604): ~4x more error per attention logit.
-//   GGML_CUDA_FA_GEMM_PREC=32 -- fp32 accumulation everywhere, and more precise than upstream:
+//     NOT the default: on a 4x P100 Windows box with CUDA 12.8 it produced NaN in long prefills
+//     (7695-token prompt: 11/11 runs, also on 2 cards there), which then sat in the KV cache and
+//     garbled every later request on the slot. fp32 never did (24/24), nor did the tile kernel.
+//     Not reproduced with cuBLAS 12.4 (0/3 at the same length, and weeks of serving 7k-75k-token
+//     prompts), so it looks like the cuBLAS fp16 kernels of some versions. Found by key-sh,
+//     qr0n/p100-llama-cpp#4. Default ONLY on cuBLAS 12.4, the one version verified clean.
+//     It is ~2% faster than fp32 at 8k and 20% faster at depth 32768 (pp2048 355 vs 295 tok/s).
+//   GGML_CUDA_FA_GEMM_PREC=32 (and the default on any other cuBLAS) -- fp32 accumulation
+//     everywhere, and more precise than upstream:
 //     QK^T runs COMPUTE_32F over the same fp16 K and Q (a product of two halves needs 22
 //     significant bits, so every product is EXACT in fp32 -- upstream rounds each product to
 //     half first); scores and probabilities are fp32 (upstream keeps them in half); V is
 //     dequantized straight to fp32 (exact for q4_0, where upstream rounds V to half); PV is
-//     all-fp32. Costs 11% of pp2048 at depth 16384 and 27% at 65536.
+//     all-fp32. Costs 11% of pp2048 at depth 16384 and 27% at 65536 against PREC=16.
 //
-// What the default costs in model output is measured by paired per-chunk perplexity against
-// PREC=32 (OPTLOG attempt 152). PREC=32 is kept as the reference.
+// What PREC=16 costs in model output is measured by paired per-chunk perplexity against fp32
+// (OPTLOG attempt 152).
 static bool ggml_cuda_fa_gemm_prec32() {
     static const bool v = [] {
         const char * s = getenv("GGML_CUDA_FA_GEMM_PREC");
-        return s && atoi(s) == 32;
+        if (s) {
+            return atoi(s) != 16;
+        }
+        int major = 0;
+        int minor = 0;
+        const bool known = cublasGetProperty(MAJOR_VERSION, &major) == CUBLAS_STATUS_SUCCESS &&
+                           cublasGetProperty(MINOR_VERSION, &minor) == CUBLAS_STATUS_SUCCESS;
+        const bool prec32 = !(known && major == 12 && minor == 4);
+        if (prec32) {
+            GGML_LOG_WARN("ggml_cuda_fa_gemm: cuBLAS %d.%d: pre-Volta GEMM flash attention runs in fp32, ~17%% slower long-context "
+                          "prefill. fp16 is verified NaN-free only on cuBLAS 12.4; GGML_CUDA_FA_GEMM_PREC=16 forces it\n",
+                          major, minor);
+        } else {
+            GGML_LOG_INFO("ggml_cuda_fa_gemm: cuBLAS %d.%d: pre-Volta GEMM flash attention runs in fp16\n", major, minor);
+        }
+        return prec32;
     }();
     return v;
 }

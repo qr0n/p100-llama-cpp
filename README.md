@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0014`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0015`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -23,7 +23,7 @@ What you get depends on your setup:
 |---|---|---|
 | any P100 (sm_60), quantized model | `0007` + `0008` | fp16 matrix-vector path: **Llama-3.1-8B Q4_K_M tg 39.3 -> 79.6, i.e. 2.03x**; qwen3.8-27b tg 25.0 -> 33.7 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
 | any P100, several sequences at once (`llama-server --parallel N`, concurrent agents) | `0011` (on top of `0007`-`0009`) | batched decode on the fp16 and fused paths: **qwen3.8-27b, 4 concurrent agents 16.0 -> 20.3 tok/s each (58.7 -> 72.9 aggregate)**, one agent unchanged — see [`docs/concurrent-decode.md`](docs/concurrent-decode.md) |
-| any pre-Volta card, long context | `0010`, **code from [Kmic-68's fork](https://github.com/Kmic-68/llama.cpp)** | cuBLAS-GEMM flash attention for long prefill plus GQA-6 tile kernels: **qwen3.8-27b pp2048 at 32k depth 285.6 -> 352.9 (+23.6%)**, perplexity unchanged — see [`docs/long-context-attention.md`](docs/long-context-attention.md) |
+| any pre-Volta card, long context | `0010`, **code from [Kmic-68's fork](https://github.com/Kmic-68/llama.cpp)** | cuBLAS-GEMM flash attention for long prefill plus GQA-6 tile kernels: **qwen3.8-27b pp2048 at 32k depth 285.6 -> 352.9 (+23.6%)** on cuBLAS 12.4, perplexity unchanged; on any other cuBLAS `0015` runs it in fp32, which gives 295 (+3.4%) — see [`docs/long-context-attention.md`](docs/long-context-attention.md) |
 | any P100, Qwen3.8 / Qwen3-Next style gated delta-net model | `0009` (on top of `0007`/`0008`) | the recurrent-state plumbing folded into its kernels: **qwen3.8-27b real-use decode 32.3 -> 35.3 tok/s (+9.1%)**, 480 fewer kernel launches per token, output bit-identical — see [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md) |
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
@@ -52,16 +52,15 @@ A3B MoE (Q6_K, so covered) is unexplained; at ~50 tok/s its plain decode is
 probably too cheap for drafting to pay. `-sm layer` never uses the AllReduce and
 works on any number of cards.
 
-**Open: NaN on 4 cards past position 4096**
-([#4](https://github.com/qr0n/p100-llama-cpp/issues/4)). On that same 4-card box,
-`-sm tensor -ub 1024` produces NaN logits once a prompt has a ubatch starting at
-position >= 4096. It does **not** reproduce on 2x P100 split into 4 virtual
-devices (Q4_K_XL and Q8_0, up to 8.2k tokens, 131k context). `0014` stops one NaN
-from poisoning the slot until a restart; the source of the first NaN is still
-unknown. If you hit it, these narrow it down, one at a time:
-`GGML_CUDA_FA_GEMM=0` (patch `0010`'s GEMM attention off),
-`GGML_CUDA_FA_GEMM_PREC=32` (that path in fp32), `GGML_CUDA_ALLREDUCE=none`
-(patch `0006` off), and `-ub 512` (does the boundary move to 2048?).
+**Garbage output after a long prompt, then on every later request**
+([#4](https://github.com/qr0n/p100-llama-cpp/issues/4), found and diagnosed by
+key-sh). With CUDA 12.8, patch `0010`'s GEMM attention in fp16 produced NaN in
+long prefills, on 2 and 4 cards alike. The NaN rows stayed in the KV cache, so the
+`llama-server` slot returned garbage until a restart. That path only engages once
+the KV cache holds >= 4096 tokens, which is why it looked like a boundary at 4096.
+It does not happen with cuBLAS 12.4. `0015` keeps fp16 on 12.4 and runs fp32 on
+every other version; the server log says which. If you see it on 12.4, set
+`GGML_CUDA_FA_GEMM_PREC=32` and please report it.
 
 **Do not set `GGML_CUDA_P2P`** — on a dual-socket P100 box it is a 10.7x
 regression (see below). Numbers everywhere in this README were measured on one
@@ -175,9 +174,15 @@ CUDA 12.4's ptxas emits that kernel anyway; 12.8's rejects it
 
 Patch `0014` is an upstream bug, on any card. Recurrent state (the gated delta-net
 layers of Qwen3.8, Mamba, RWKV) was cleared for a new sequence by scaling it by 0,
-and `0 * NaN` is NaN. So one non-finite state left that `llama-server` slot
-returning garbage for every later request until a restart. It is now cleared
-with a fill.
+and `0 * NaN` is NaN. So a non-finite state left that `llama-server` slot returning
+garbage for every later request until a restart. It is now cleared with a fill.
+This was not what kept the slots in #4 broken; that was the KV cache, see `0015`.
+
+Patch `0015` makes `0010`'s GEMM attention use fp32 unless cuBLAS is 12.4. Its
+fp16 path produced NaN on cuBLAS 12.8 (#4, key-sh's diagnosis; fp32 was clean
+24/24 there) and never has on 12.4. fp32 costs 16.8% of pp2048 at depth 32768
+here (355 -> 295 tok/s), most of `0010`'s gain, so 12.4 keeps fp16.
+`GGML_CUDA_FA_GEMM_PREC=16` or `=32` overrides the choice either way.
 
 `0001` and `0002` are 61 added lines across two files: one architecture-neutral,
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and

@@ -1102,6 +1102,313 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 }
 
+// Q8_0 (and IQ4_NL, not dispatched: slower than the generic kernel) with 2..8 columns: gp100_mmvq_b32's staging, each lane's block unpacked ONCE into 16 half2 registers,
+// then every column FMA'd against them. Activation reads use a clamped block index so they are unconditional (and
+// identical for every row, so they are loaded once per column; see gp100_mmvq_q6_K_nc); `act` gates only the sum.
+template <ggml_type type, int R, int KS, int NC>
+static __global__ void __launch_bounds__(128) gp100_mmvq_b32_nc(
+        const void * __restrict__ vW, const half * __restrict__ y, const float2 * __restrict__ ys,
+        float * __restrict__ dst, const int nrows, const int nsb, const int stride_row, const int stride_dst) {
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    typedef typename gp100_b32<type>::block block;
+    constexpr int BS     = sizeof(block);
+    constexpr int SEG_U4 = 32 * BS / sizeof(uint4);
+    constexpr uint32_t T0 = 0x3F2D1801u, T1 = 0x766A5D4Fu, T2 = 0xA6998D81u, T3 = 0xF1D9C5B5u; // kvalues_iq4nl + 128
+    __shared__ uint4 stage[4][R][SEG_U4 + 1];
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int row0 = (blockIdx.x * (4 / KS) + warp / KS) * R;
+    const int nb   = nsb * (QK_K / QK8_0);
+    const int K    = nb * QK8_0;
+
+    const uint4 * rowp[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        rowp[r] = (const uint4 *) ((const block *) vW + (int64_t) min(row0 + r, nrows - 1) * stride_row);
+    }
+
+    float sum[NC * R]; // [c][r]: the store helpers see NC*R rows, and dst row c*R + r is mapped below
+#pragma unroll
+    for (int i = 0; i < NC * R; i++) {
+        sum[i] = 0.0f;
+    }
+
+    for (int c0 = warp % KS; c0 * 32 < nb; c0 += KS) {
+        const int b0   = c0 * 32;
+        const int nblk = min(nb - b0, 32);
+        const int nu4  = (nblk * BS + 15) / 16;
+        uint4 v0[R], v1[R], v2[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint4 * src = rowp[r] + b0 * BS / 16;
+            v0[r] = lane      < nu4 ? __ldg(src + lane)      : make_uint4(0, 0, 0, 0);
+            v1[r] = lane + 32 < nu4 ? __ldg(src + lane + 32) : make_uint4(0, 0, 0, 0);
+            v2[r] = SEG_U4 > 64 && lane + 64 < nu4 ? __ldg(src + lane + 64) : make_uint4(0, 0, 0, 0);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            stage[warp][r][lane] = v0[r];
+            if (lane + 32 < SEG_U4) {
+                stage[warp][r][lane + 32] = v1[r];
+            }
+            if (lane + 64 < SEG_U4) {
+                stage[warp][r][lane + 64] = v2[r];
+            }
+        }
+        __syncwarp();
+
+        const bool act = lane < nblk;
+        const int  bc  = act ? b0 + lane : nb - 1;
+
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint8_t  * bb  = (const uint8_t *) &stage[warp][r][0] + BS * lane;
+            const uint32_t * w   = (const uint32_t *) ((uintptr_t) bb & ~(uintptr_t) 3);
+            const uint32_t   shf = ((uintptr_t) bb & 3) * 8;
+            const half       d   = __ushort_as_half((unsigned short) (__funnelshift_r(w[0], w[1], shf) & 0xFFFF));
+            const int      qo  = (shf + 16) / 32;
+            const uint32_t qsh = (shf + 16) % 32;
+            uint32_t wv[16]; // this lane's 32 weights (+128) as subnormal half2, in y order
+            if constexpr (type == GGML_TYPE_Q8_0) {
+#pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    const uint32_t q = __funnelshift_r(w[qo + k], w[qo + k + 1], qsh) ^ 0x80808080u;
+                    wv[2*k + 0] = __byte_perm(q, 0, 0x4140);
+                    wv[2*k + 1] = __byte_perm(q, 0, 0x4342);
+                }
+            } else {
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const uint32_t q  = __funnelshift_r(w[qo + k], w[qo + k + 1], qsh);
+                    const uint32_t qx = q ^ 0x88888888u;
+                    const uint32_t S  = ((q >> 1) & 0x44444444u) | 0x32103210u;
+                    const uint32_t v0 = gp100_prmt(gp100_prmt(T0, T1, q),       gp100_prmt(T2, T3, qx),       S);
+                    const uint32_t v1 = gp100_prmt(gp100_prmt(T0, T1, q >> 16), gp100_prmt(T2, T3, qx >> 16), S >> 16);
+                    wv[2*k + 0]     = __byte_perm(v0, 0, 0x4240);
+                    wv[2*k + 1]     = __byte_perm(v1, 0, 0x4240);
+                    wv[8 + 2*k + 0] = __byte_perm(v0, 0, 0x4341);
+                    wv[8 + 2*k + 1] = __byte_perm(v1, 0, 0x4341);
+                }
+            }
+            const float df = __half2float(d);
+#pragma unroll
+            for (int c = 0; c < NC; c++) {
+                const uint4 * yp = (const uint4 *) (y + (int64_t) c * K + 32 * bc);
+                const uint4 yv[4] = {__ldg(yp), __ldg(yp + 1), __ldg(yp + 2), __ldg(yp + 3)};
+                const float2 sc = __ldg(ys + (int64_t) c * nb + bc);
+                const half2 * Y = (const half2 *) yv;
+                half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    acc = __hfma2(*(const half2 *) &wv[i], Y[i], acc);
+                }
+                const float sv = __half2float(__hadd(__low2half(acc), __high2half(acc)));
+                if (act) {
+                    sum[c * R + r] = fmaf(df, fmaf(sv, sc.x, -128.0f * sc.y), sum[c * R + r]);
+                }
+            }
+        }
+    }
+
+    // reduce like gp100_store / gp100_store_ksplit, then write column c of row r to dst[c * stride_dst + row0 + r]
+#pragma unroll
+    for (int i = 0; i < NC * R; i++) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            sum[i] += __shfl_xor_sync(0xFFFFFFFF, sum[i], o);
+        }
+    }
+    if constexpr (KS > 1) {
+        __shared__ float red[4][NC * R];
+        if (lane == 0) {
+#pragma unroll
+            for (int i = 0; i < NC * R; i++) {
+                red[warp][i] = sum[i];
+            }
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+#pragma unroll
+        for (int i = 0; i < NC * R; i++) {
+            sum[i] = red[0][i] + red[1][i] + red[2][i] + red[3][i];
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (row0 + r < nrows) {
+                    dst[(int64_t) c * stride_dst + row0 + r] = sum[c * R + r];
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vW, y, ys, dst, nrows, nsb, stride_row, stride_dst);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
+// Q3_K with 2..8 columns: gp100_mmvq_q3_K's staging and unpack, each row's 32 weights per thread unpacked once,
+// then every column FMA'd against them. Activation reads use a clamped super-block (unconditional, shared across
+// rows); `act` gates only the accumulation.
+template <int R, int NC>
+static __global__ void __launch_bounds__(128) gp100_mmvq_q3_K_nc(
+        const void * __restrict__ vW, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
+        float * __restrict__ dst, const int nrows, const int nsb, const int stride_row, const int stride_dst) {
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    constexpr int BS = sizeof(block_q3_K); // 110
+    constexpr int STAGE_U4 = (15 + 4*BS + 15) / 16 + 1;
+    __shared__ uint4 stage[4][R][STAGE_U4];
+    const int K = nsb * QK_K;
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int row0 = (blockIdx.x * 4 + warp) * R;
+    const int g = lane / 8;
+    const int t = lane % 8;
+    const int n = t / 4;
+    const int c = t % 4;
+    const int i0 = c / 2;
+    const float offm = (c & 1) ? 0.0f : -4.0f;
+    const int sA  = 4 * n;
+    const int sC0 = 4 * n;
+    const int sC1 = 2 + 4 * n;
+
+    const uint4 * gp[R];
+    int mis[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const uintptr_t a = (uintptr_t) ((const block_q3_K *) vW + (int64_t) min(row0 + r, nrows - 1) * stride_row);
+        gp[r]  = (const uint4 *) (a & ~(uintptr_t) 15);
+        mis[r] = a & 15;
+    }
+
+    float sum[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+#pragma unroll
+        for (int cc = 0; cc < NC; cc++) {
+            sum[r][cc] = 0.0f;
+        }
+    }
+
+    const int nit = (nsb + 3) / 4;
+    for (int it = 0; it < nit; it++) {
+        const int  sb   = 4 * it + g;
+        const bool act  = sb < nsb;
+        const int  sbc  = act ? sb : nsb - 1;
+        const int  nblk = min(nsb - 4 * it, 4);
+
+        int m[R];
+        uint4 v0[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const int off = mis[r] + 4 * BS * it;
+            m[r] = off & 15;
+            const int nu4 = (m[r] + BS * nblk + 15) >> 4;
+            v0[r] = lane < nu4 ? __ldg(gp[r] + (off >> 4) + lane) : make_uint4(0, 0, 0, 0);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (lane < STAGE_U4) {
+                stage[warp][r][lane] = v0[r];
+            }
+        }
+        __syncwarp();
+
+        // per-column activation scales and -4 offsets, independent of the row
+        float rs[NC][4], so[NC][4];
+#pragma unroll
+        for (int cc = 0; cc < NC; cc++) {
+            const float2 * ysc = ys + (int64_t) cc * (K / 32);
+            const float4 rs01 = __ldg((const float4 *) (ysc + sbc * 8 + 4 * n));
+            const float4 rs23 = __ldg((const float4 *) (ysc + sbc * 8 + 4 * n + 2));
+            rs[cc][0] = rs01.x; rs[cc][1] = rs01.z; rs[cc][2] = rs23.x; rs[cc][3] = rs23.z;
+            const float * sp = s16 + (int64_t) cc * (K / 16) + sbc * 16 + 8 * n + i0;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                so[cc][j] = __ldg(sp + 2 * j) * offm;
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint8_t  * bb  = (const uint8_t *) &stage[warp][r][0] + m[r] + BS * g;
+            const uint32_t * w   = (const uint32_t *) ((uintptr_t) bb & ~(uintptr_t) 3);
+            const uint32_t   shf = ((uintptr_t) bb & 3) * 8;
+            auto ld4 = [&](const int byteoff) {
+                const uint32_t * q = w + byteoff / 4;
+                return __funnelshift_r(q[0], q[1], shf);
+            };
+            const uint32_t QS[2] = {ld4(32 + 32 * n + 8 * c), ld4(32 + 32 * n + 8 * c + 4)};
+            const uint32_t HM[2] = {ld4(8 * c), ld4(8 * c + 4)};
+            const uint32_t A = ld4(96), B = ld4(100), C = ld4(104);
+            const uint32_t DW = ld4(108);
+            const uint32_t W0 = ((A >> sA) & 0x0F0F0F0Fu) | (((C >> sC0) & 0x03030303u) << 4);
+            const uint32_t W1 = ((B >> sA) & 0x0F0F0F0Fu) | (((C >> sC1) & 0x03030303u) << 4);
+
+            uint32_t wv[4][4]; // [run j][2k + half]
+#pragma unroll
+            for (int k = 0; k < 2; k++) {
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const uint32_t v = ((QS[k] >> (2 * j)) & 0x03030303u) | (((HM[k] >> (4 * n + j)) & 0x01010101u) << 2);
+                    wv[j][2*k + 0] = __byte_perm(v, 0, 0x4140);
+                    wv[j][2*k + 1] = __byte_perm(v, 0, 0x4342);
+                }
+            }
+            const float sc[4] = {gp100_byte_f(W0, i0) - 32.0f, gp100_byte_f(W0, i0 + 2) - 32.0f,
+                                 gp100_byte_f(W1, i0) - 32.0f, gp100_byte_f(W1, i0 + 2) - 32.0f};
+            const float dd = __half2float(__ushort_as_half((unsigned short) (DW & 0xFFFF)));
+#pragma unroll
+            for (int cc = 0; cc < NC; cc++) {
+                const uint4 * yp = (const uint4 *) (y + (int64_t) cc * K + sbc * 256 + 128 * n + 8 * c);
+                const uint4 yv[4] = {__ldg(yp), __ldg(yp + 4), __ldg(yp + 8), __ldg(yp + 12)};
+                float s = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const half2 * Y = (const half2 *) &yv[j];
+                    half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        acc = __hfma2(*(const half2 *) &wv[j][i], Y[i], acc);
+                    }
+                    s = fmaf(sc[j], fmaf(__half2float(__hadd(__low2half(acc), __high2half(acc))), rs[cc][j], so[cc][j]), s);
+                }
+                if (act) {
+                    sum[r][cc] = fmaf(dd, s, sum[r][cc]);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+#pragma unroll
+        for (int cc = 0; cc < NC; cc++) {
+            float v = sum[r][cc];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(0xFFFFFFFF, v, o);
+            }
+            if (lane == 0 && row0 + r < nrows) {
+                dst[(int64_t) cc * stride_dst + row0 + r] = v;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vW, y, ys, s16, dst, nrows, nsb, stride_row, stride_dst);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
 // Columns of a matmul operand: its rows, or its ne[2] when it is [K, 1, n] (one token per sequence), else 0.
 static int64_t gp100_ncols(const ggml_tensor * t) {
     return t->ne[2] == 1 ? t->ne[1] : (t->ne[1] == 1 ? t->ne[2] : 0);
@@ -1143,7 +1450,12 @@ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, cons
     const int64_t ncols = gp100_ncols(src1);
     if (ncols < 1 || ncols > 8 || gp100_ncols(dst) != ncols || src1->ne[1] != dst->ne[1] ||
         (ncols > 1 && (fusion || (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
-                                  src0->type != GGML_TYPE_IQ4_XS && !(src0->type == GGML_TYPE_Q6_K && ncols <= 4))))) {
+                                  src0->type != GGML_TYPE_IQ4_XS &&
+                                  src0->type != GGML_TYPE_Q3_K && !(src0->type == GGML_TYPE_Q8_0 && src0->ne[1] >= 2048) &&
+                                  !(src0->type == GGML_TYPE_Q6_K && ncols <= 4))))) {
+        // Multi-column Q8_0 takes large matrices only: at 4 columns it wins there (0.178 -> 0.085 ms) but the
+        // 24-row alpha/beta projections run only 24 blocks and lose (8 -> 10 us each). IQ4_NL stays generic: its
+        // multi-column kernel measured 0.96 vs 0.85 ms at 4 columns with 1, 2 or 4 rows per warp.
         // Q6_K's multi-column kernel (gp100_mmvq_q6_K_nc) loses to the generic int8 path at 5 columns in situ
         // (7.68 vs 6.18 ms per MTP verify batch) but wins at 4 concurrent sequences (batched decode 73.1 -> 74.2
         // tok/s aggregate), so it takes 2..4 columns only
@@ -1222,11 +1534,11 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void * 
             }
             GGML_ABORT("Q8_0 supports at most 4 rows per warp");
         case GGML_TYPE_Q3_K:
-            if constexpr (R <= 4) {
+            if constexpr (R <= 8) {
                 GP100_LAUNCH((gp100_mmvq_q3_K<R, GLU>));
                 break;
             }
-            GGML_ABORT("Q3_K supports at most 4 rows per warp");
+            GGML_ABORT("Q3_K supports at most 8 rows per warp");
         case GGML_TYPE_IQ4_NL:
             if constexpr (R <= 4) {
                 GP100_LAUNCH_B32(GGML_TYPE_IQ4_NL);
@@ -1257,7 +1569,9 @@ static void gp100_dispatch(const ggml_type type, const void * W, const void * G,
     // epilogue dominate a very short inner loop, and it measures ~237 GB/s against ~466 for every other
     // Q6_K tensor. Eight rows amortise that. 4 warps x 8 rows x 896 B = 28672 B of staging still fits two
     // blocks per SM on GP100's 64 KB. Body tensors keep 4: they have long rows and want the occupancy.
-    const bool q6k_wide = type == GGML_TYPE_Q6_K && !GLU && nrows >= 32768;
+    // Q3_K takes the same rule: the MTP draft head's output projection is Q3_K at 124160 rows x K 2560 and ran
+    // ~136 GB/s at 4 rows per warp (staging is 480 B/row, so 8 rows fit in 15 KB).
+    const bool q6k_wide = (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q3_K) && !GLU && nrows >= 32768;
     if (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q3_K) {
         R = std::min(R, q6k_wide ? 8 : (GLU ? 2 : 4)); // shared staging: 4 warps x RT rows x 896 (Q6_K) or 1088 (Q8_0) bytes
     }
@@ -1289,6 +1603,13 @@ static void gp100_launch_nc(const void * W, const half * y, const float2 * ys, c
     const int nblocks = (nrows + 4*R - 1) / (4*R);
     if constexpr (type == GGML_TYPE_Q6_K) {
         gp100_mmvq_q6_K_nc<R, NC><<<nblocks, 128, 0, stream>>>(W, y, ys, s16, dst, nrows, nsb, stride_row, stride_dst);
+    } else if constexpr (type == GGML_TYPE_Q3_K) {
+        gp100_mmvq_q3_K_nc<R, NC><<<nblocks, 128, 0, stream>>>(W, y, ys, s16, dst, nrows, nsb, stride_row, stride_dst);
+    } else if constexpr (type == GGML_TYPE_Q8_0) {
+        // short matrices split K over the block's 4 warps (as gp100_mmvq_b32 does), long ones take 2 rows per warp
+        // large matrices only (the support gate keeps short ones on the generic kernel); 4 rows per warp
+        // (in situ at 4 columns: R=1 0.133, R=2 0.122, R=4 0.085 ms)
+        gp100_mmvq_b32_nc<type, 4, 1, NC><<<(nrows + 15) / 16, 128, 0, stream>>>(W, y, ys, dst, nrows, nsb, stride_row, stride_dst);
     } else if constexpr (type == GGML_TYPE_IQ4_XS) {
         gp100_mmvq_iq4_xs_nc<R, NC><<<nblocks, 128, 0, stream>>>(W, y, ys, dst, nrows, nsb, stride_row, stride_dst);
     } else {
@@ -1318,6 +1639,8 @@ static void gp100_dispatch_nc(const ggml_type type, const void * W, const half *
         case GGML_TYPE_Q5_K: gp100_dispatch_nc_t<GGML_TYPE_Q5_K>(W, y, ys, s16, dst, nrows, nsb, stride_row, ncols, stride_dst, stream); break;
         case GGML_TYPE_IQ4_XS: gp100_dispatch_nc_t<GGML_TYPE_IQ4_XS>(W, y, ys, s16, dst, nrows, nsb, stride_row, ncols, stride_dst, stream); break;
         case GGML_TYPE_Q6_K: gp100_dispatch_nc_t<GGML_TYPE_Q6_K>(W, y, ys, s16, dst, nrows, nsb, stride_row, ncols, stride_dst, stream); break;
+        case GGML_TYPE_Q3_K: gp100_dispatch_nc_t<GGML_TYPE_Q3_K>(W, y, ys, s16, dst, nrows, nsb, stride_row, ncols, stride_dst, stream); break;
+        case GGML_TYPE_Q8_0: gp100_dispatch_nc_t<GGML_TYPE_Q8_0>(W, y, ys, s16, dst, nrows, nsb, stride_row, ncols, stride_dst, stream); break;
         default: GGML_ABORT("no GP100 multi-column kernel for this type");
     }
 }
@@ -1363,6 +1686,8 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     ggml_cuda_pool_alloc<char> tmp(ctx.pool());
     char * base;
+    size_t off_ys  = GP100_OFF_YS;
+    size_t off_s16 = GP100_OFF_S16;
     bool   hit = false;
     if (gp100_cache_enabled() && K * ncols <= GP100_ACT_CACHE_MAX_K) {
         gp100_act_cache & c = gp100_cache(ctx);
@@ -1370,11 +1695,16 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         c.src1 = src1; c.data = src1->data; c.K = K; c.ncols = ncols; c.epoch = ctx.graph_epoch;
         base = c.buf;
     } else {
-        base = tmp.alloc(GP100_ACT_BYTES);
+        // sized for THIS matmul: a fixed GP100_ACT_BYTES overflows once K * ncols > GP100_ACT_CACHE_MAX_K
+        // (e.g. a DFlash drafter's fc, K = 25600, at 6+ columns)
+        const int64_t n = std::max<int64_t>(K * ncols, GP100_ACT_CACHE_MAX_K);
+        off_ys  = GGML_PAD(n * sizeof(half), 256);
+        off_s16 = off_ys + GGML_PAD(n / 32 * sizeof(float2), 256);
+        base = tmp.alloc(off_s16 + n / 16 * sizeof(float));
     }
     half   * y   = (half   *) base;
-    float2 * ys  = (float2 *) (base + GP100_OFF_YS);
-    float  * s16 = (float  *) (base + GP100_OFF_S16);
+    float2 * ys  = (float2 *) (base + off_ys);
+    float  * s16 = (float  *) (base + off_s16);
     if (!hit) {
         const int nblk = nb32 * ncols;
         gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, gp100_col_stride(src1));

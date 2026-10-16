@@ -3463,11 +3463,16 @@ static bool ggml_cuda_gp100_softplus_bias_match(const ggml_cgraph * cgraph, int 
     const ggml_tensor * x = A->src[0];
     const ggml_tensor * b = A->src[1];
     const ggml_tensor * a = M->src[1];
+    // b and a: the full n values, or one row of x's ne[0] broadcast over the other dims (batched decode)
     const int64_t n = ggml_nelements(M);
     for (const ggml_tensor * t : { x, b, a, A, SP, M }) {
-        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nelements(t) != n || t->data == nullptr) {
+        const bool row = (t == b || t == a) && ggml_nelements(t) == x->ne[0] && t->ne[0] == x->ne[0];
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || (ggml_nelements(t) != n && !row) || t->data == nullptr) {
             return false;
         }
+    }
+    if (ggml_nelements(b) != ggml_nelements(a)) {
+        return false;
     }
     return !ggml_cuda_gp100_overlap(M, x) || M->data == x->data;
 }
@@ -3487,7 +3492,8 @@ static bool ggml_cuda_gp100_softplus_bias(ggml_backend_cuda_context * cuda_ctx, 
     const ggml_tensor * A = cgraph->nodes[i - 1];
     ggml_tensor *       M = cgraph->nodes[i + 1];
     ggml_cuda_gp100_softplus_bias_mul(*cuda_ctx, (const float *) A->src[0]->data, (const float *) A->src[1]->data,
-                                      (const float *) M->src[1]->data, (float *) M->data, (int) ggml_nelements(M));
+                                      (const float *) M->src[1]->data, (float *) M->data, (int) ggml_nelements(M),
+                                      (int) ggml_nelements(M->src[1]));
     return true;
 }
 

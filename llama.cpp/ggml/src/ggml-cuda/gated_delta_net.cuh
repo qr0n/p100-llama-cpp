@@ -29,4 +29,4 @@ bool ggml_cuda_gp100_state_fusion_disabled();
 
 // GP100: dst = softplus(x + b) * a over n contiguous elements (ADD -> SOFTPLUS -> MUL in one launch)
 void ggml_cuda_gp100_softplus_bias_mul(ggml_backend_cuda_context & ctx, const float * x, const float * b, const float * a,
-                                       float * dst, int n);
+                                       float * dst, int n, int nb);

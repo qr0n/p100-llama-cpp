@@ -13,7 +13,7 @@ This repo ships a ready-to-build llama.cpp with every patch already applied:
     # two P100s: tensor split is where patches 0003/0004 apply
     llama.cpp/build/bin/llama-server -m model.gguf -ngl 99 -sm tensor
 
-`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0015`, nothing else;
+`llama.cpp/` is upstream **`b10660`** plus `patches/0001`-`0018`, nothing else;
 `tools/verify-source.sh` re-derives it from upstream and diffs to prove that. It is
 the exact source running on the machine these numbers came from.
 
@@ -22,9 +22,9 @@ What you get depends on your setup:
 | your setup | what applies | expect |
 |---|---|---|
 | any P100 (sm_60), quantized model | `0007` + `0008` | fp16 matrix-vector path: **Llama-3.1-8B Q4_K_M tg 39.3 -> 79.6, i.e. 2.03x**; qwen3.8-27b tg 25.0 -> 33.7 on two cards, MTP 26.2 -> 40.9 tok/s on real prompts, *more* accurate than stock — see [`docs/fp16-mmvq.md`](docs/fp16-mmvq.md) |
-| any P100, several sequences at once (`llama-server --parallel N`, concurrent agents) | `0011` (on top of `0007`-`0009`) | batched decode on the fp16 and fused paths: **qwen3.8-27b, 4 concurrent agents 16.0 -> 20.3 tok/s each (58.7 -> 72.9 aggregate)**, one agent unchanged — see [`docs/concurrent-decode.md`](docs/concurrent-decode.md) |
+| any P100, several sequences at once (`llama-server --parallel N`, concurrent agents) | `0011` (on top of `0007`-`0009`), then `0016` | batched decode on the fp16 and fused paths: **qwen3.8-27b, 4 concurrent agents 16.0 -> 20.3 tok/s each (58.7 -> 72.9 aggregate)**, one agent unchanged — see [`docs/concurrent-decode.md`](docs/concurrent-decode.md). `0016` adds multi-column Q3_K and large-matrix Q8_0 kernels: +1.7% more at 4 sequences, and MTP verification on those types leaves the int8 path |
 | any pre-Volta card, long context | `0010`, **code from [Kmic-68's fork](https://github.com/Kmic-68/llama.cpp)** | cuBLAS-GEMM flash attention for long prefill plus GQA-6 tile kernels: **qwen3.8-27b pp2048 at 32k depth 285.6 -> 352.9 (+23.6%)** on cuBLAS 12.4, perplexity unchanged; on any other cuBLAS `0015` runs it in fp32, which gives 295 (+3.4%) — see [`docs/long-context-attention.md`](docs/long-context-attention.md) |
-| any P100, Qwen3.8 / Qwen3-Next style gated delta-net model | `0009` (on top of `0007`/`0008`) | the recurrent-state plumbing folded into its kernels: **qwen3.8-27b real-use decode 32.3 -> 35.3 tok/s (+9.1%)**, 480 fewer kernel launches per token, output bit-identical — see [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md) |
+| any P100, Qwen3.8 / Qwen3-Next style gated delta-net model | `0009` (on top of `0007`/`0008`) | the recurrent-state plumbing folded into its kernels: **qwen3.8-27b real-use decode 32.3 -> 35.3 tok/s (+9.1%)**, 480 fewer kernel launches per token, output bit-identical — see [`docs/delta-net-fusions.md`](docs/delta-net-fusions.md). `0018` packs 4 state columns per warp in prefill: **pp2048 446.7 -> 463.8 (+3.8%)**, also bit-identical |
 | one P100, K-quant model (Q4_K_M etc.) | `0001` + `0002` | the big decode win, e.g. +33% tg on Llama-3.1-8B |
 | any P100 | `0005`, and the default f16 KV cache (do **not** pass `-ctk q8_0`) | ~+5% prompt processing; f16 KV grows to +24% tg at long context |
 | two P100s with `-sm tensor` | all of the above + `0003` + `0004` | a further ~+15% prompt processing, +10% tg |
@@ -47,7 +47,9 @@ X99, Windows): dense Qwen3.8-27B Q8_0 at 262k context goes from ~13 tok/s stock 
 and `GGML_CUDA_P2P=1` costs **40%**, so leave both unset. A3B MoE prefers
 `-sm layer` (50-51 vs 20-22 tok/s). The same report found MTP slower in every
 case it tried. For 27B Q8_0 the cause is known: the multi-column fp16 kernels
-that make MTP verification cheap here cover Q4_K/Q5_K/IQ4_XS/Q6_K, not Q8_0. The
+that make MTP verification cheap here covered Q4_K/Q5_K/IQ4_XS/Q6_K, not Q8_0, at
+the time. `0016` adds a Q8_0 one for matrices of 2048+ rows (most of a dense 27B,
+even split four ways); it has not been measured on a Q8_0 model with MTP. The
 A3B MoE (Q6_K, so covered) is unexplained; at ~50 tok/s its plain decode is
 probably too cheap for drafting to pay. `-sm layer` never uses the AllReduce and
 works on any number of cards.
@@ -183,6 +185,26 @@ fp16 path produced NaN on cuBLAS 12.8 (#4, key-sh's diagnosis; fp32 was clean
 24/24 there) and never has on 12.4. fp32 costs 16.8% of pp2048 at depth 32768
 here (355 -> 295 tok/s), most of `0010`'s gain, so 12.4 keeps fp16.
 `GGML_CUDA_FA_GEMM_PREC=16` or `=32` overrides the choice either way.
+
+Patch `0016` covers the last shapes that still left the fp16 path with 2..8
+columns: Q3_K (here, Qwen3.8-27B's MTP draft head: 0.83 -> 0.48 ms per step at 4
+sequences), Q8_0 matrices of 2048+ rows (0.178 -> 0.085 ms at 4 columns; smaller
+ones lose and keep the generic kernel), and the softplus fusion of `0009` in
+batched decode. Four sequences: 86.8 -> 88.3 tok/s aggregate.
+
+Patch `0017` is a buffer overrun in `0007`. When `K * ncols` exceeds the
+activation cache (8 x 17408) the activations go to a pool buffer that was still
+allocated at the fixed cache size, so the conversion wrote past it. Qwen3.8-27B
+never gets there (widest K 17408, at most 8 columns). A DFlash2 drafter's Q4_K
+`fc` (K 25600) does at 6+ columns, and drafted garbage: 7 of 1687 tokens accepted,
+214 of 238 with the fix. Any model with wider matrices and batched verification
+or `--parallel` can hit it.
+
+Patch `0018` is prefill for gated delta-net models. A 2048-token prefill launched
+768 blocks, two waves; four state columns per warp share the k/q loads and fit
+one. **pp2048 and pp8192 +3.8%**, real 4-11k-token prompts +3.4-3.7%, MTP decode
++1.2%, output bit-identical. `GP100_GDN_CPW=1` restores the stock launch. It also
+gives Q3_K output-sized matrices 8 rows per warp, the rule Q6_K already had.
 
 `0001` and `0002` are 61 added lines across two files: one architecture-neutral,
 the other guarded to GP100 and byte-identical SASS on every other card. `0003` and
